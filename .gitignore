@@ -1,0 +1,24 @@
+# Build artifacts
+roam
+*.o
+
+# RPM build
+*.rpm
+~/rpmbuild/
+
+# Debian build
+*.deb
+*.buildinfo
+*.changes
+
+# Arch build
+*.pkg.tar.*
+
+# Archives
+*.zip
+*.tar.gz
+
+# IDE / editor
+.fastembed_cache/
+.claude/
+notes

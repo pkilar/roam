@@ -1,0 +1,12 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	$(MAKE) CC=gcc CFLAGS="$(CFLAGS) $(CPPFLAGS) $(LDFLAGS)"
+
+override_dh_auto_install:
+	install -Dm0755 roam $(CURDIR)/debian/roam/usr/sbin/roam
+	install -Dm0644 roam.conf $(CURDIR)/debian/roam/etc/sysconfig/roam
+	install -Dm0440 roam.sudoers $(CURDIR)/debian/roam/etc/sudoers.d/roam

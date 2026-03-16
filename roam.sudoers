@@ -1,0 +1,17 @@
+# /etc/sudoers.d/roam
+#
+# Allow members of the 'wheel' group to launch a read-only shell
+# as the 'roam' user, with full I/O session logging for audit.
+#
+# Usage:  sudo -u roam /usr/local/sbin/roam
+#         sudo -u roam /usr/local/sbin/roam cat /etc/shadow
+#
+# Install: visudo -f /etc/sudoers.d/roam
+# Adjust the group (%wheel) and path as needed for your environment.
+
+# Enable session I/O logging for audit trail (requires sudo 1.8+).
+# Logs are stored in /var/log/sudo-io/ by default.
+Defaults:%wheel log_input, log_output
+
+# Allow wheel members to run roam as the roam user without a password.
+%wheel ALL=(roam) NOPASSWD: /usr/local/sbin/roam
