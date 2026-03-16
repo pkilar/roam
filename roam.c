@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -105,6 +106,26 @@ static char *unquote(char *s)
     return s;
 }
 
+static int is_abs_path(const char *s)
+{
+    return s && s[0] == '/';
+}
+
+static char *canonicalize_path(const char *path, const char *what)
+{
+    if (!is_abs_path(path)) {
+        fprintf(stderr, "roam: %s path must be absolute: %s\n", what, path);
+        return NULL;
+    }
+    char *resolved = realpath(path, NULL);
+    if (!resolved) {
+        fprintf(stderr, "roam: %s path '%s': %s (skipped)\n",
+                what, path, strerror(errno));
+        return NULL;
+    }
+    return resolved;
+}
+
 /* --- Configuration --- */
 
 struct config {
@@ -121,7 +142,9 @@ static void config_add_paths(struct config *cfg, const char *paths)
         return;
     char *tok = strtok(buf, " \t");
     while (tok && cfg->writable_count < MAX_WRITABLE) {
-        cfg->writable[cfg->writable_count++] = strdup(tok);
+        char *canon = canonicalize_path(tok, "writable");
+        if (canon)
+            cfg->writable[cfg->writable_count++] = canon;
         tok = strtok(NULL, " \t");
     }
     free(buf);
@@ -176,7 +199,7 @@ static void config_load(struct config *cfg)
             config_add_paths(cfg, val);
         } else if (strcmp(key, "ROAM_SHELL") == 0) {
             free(cfg->shell);
-            cfg->shell = strdup(val);
+            cfg->shell = canonicalize_path(val, "shell");
         } else if (strcmp(key, "ROAM_USER") == 0) {
             free(cfg->user);
             cfg->user = strdup(val);
