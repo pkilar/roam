@@ -155,6 +155,8 @@ static void config_load(struct config *cfg)
     int got_writable = 0;
 
     cfg->user = strdup(DEFAULT_USER);
+    if (!cfg->user)
+        die("strdup");
     cfg->shell = NULL;
 
     FILE *f = fopen(CONFIG_PATH, "r");
@@ -203,6 +205,8 @@ static void config_load(struct config *cfg)
         } else if (strcmp(key, "ROAM_USER") == 0) {
             free(cfg->user);
             cfg->user = strdup(val);
+            if (!cfg->user)
+                die("strdup");
         }
     }
     fclose(f);
@@ -293,7 +297,9 @@ int main(int argc, char *argv[])
     /* Always add the user's home as a writable exception. */
     if (pw->pw_dir && pw->pw_dir[0] != '\0' &&
         cfg.writable_count < MAX_WRITABLE) {
-        cfg.writable[cfg.writable_count++] = strdup(pw->pw_dir);
+        char *home = canonicalize_path(pw->pw_dir, "home");
+        if (home)
+            cfg.writable[cfg.writable_count++] = home;
     }
 
     /* ================================================================
@@ -334,7 +340,7 @@ int main(int argc, char *argv[])
      *     Requires CAP_SETPCAP (which we have from file caps).
      *     Non-fatal if SETPCAP is missing — defense-in-depth only. */
     if (cap_in_effective(CAP_SETPCAP)) {
-        for (int c = 0; ; c++) {
+        for (int c = 0; c < 64; c++) {
             if (c == CAP_DAC_READ_SEARCH)
                 continue;
             if (prctl(PR_CAPBSET_DROP, c, 0, 0, 0) == -1) {
@@ -412,38 +418,20 @@ int main(int argc, char *argv[])
         LANDLOCK_ACCESS_FS_READ_FILE |
         LANDLOCK_ACCESS_FS_READ_DIR;
 
-    /* Full read+write access mask for DIRECTORY exceptions. */
-    __u64 rw_dir_access =
-        LANDLOCK_ACCESS_FS_EXECUTE |
-        LANDLOCK_ACCESS_FS_READ_FILE |
-        LANDLOCK_ACCESS_FS_READ_DIR |
-        LANDLOCK_ACCESS_FS_WRITE_FILE |
-        LANDLOCK_ACCESS_FS_REMOVE_DIR |
-        LANDLOCK_ACCESS_FS_REMOVE_FILE |
-        LANDLOCK_ACCESS_FS_MAKE_CHAR |
-        LANDLOCK_ACCESS_FS_MAKE_DIR |
-        LANDLOCK_ACCESS_FS_MAKE_REG |
-        LANDLOCK_ACCESS_FS_MAKE_SOCK |
-        LANDLOCK_ACCESS_FS_MAKE_FIFO |
-        LANDLOCK_ACCESS_FS_MAKE_BLOCK |
-        LANDLOCK_ACCESS_FS_MAKE_SYM;
-    if (abi >= 2)
-        rw_dir_access |= LANDLOCK_ACCESS_FS_REFER;
-    if (abi >= 3)
-        rw_dir_access |= LANDLOCK_ACCESS_FS_TRUNCATE;
-    rw_dir_access &= abi_mask[abi - 1];
+    /* Full access mask for DIRECTORY exceptions — grant every handled right.
+     * File-specific rights (e.g. IOCTL_DEV) propagate to files beneath. */
+    __u64 rw_dir_access = ruleset_attr.handled_access_fs;
 
     /* Write access mask for FILE exceptions (e.g. /dev/null, /dev/tty).
-     * Landlock rejects directory-only rights on file fds, so we must
-     * use only file-compatible rights here. */
-    __u64 rw_file_access =
+     * Landlock rejects directory-only rights on file fds, so intersect
+     * with only file-compatible rights.  ABI masking is already applied
+     * to handled_access_fs, so version checks are implicit. */
+    static const __u64 file_compat =
         LANDLOCK_ACCESS_FS_READ_FILE |
-        LANDLOCK_ACCESS_FS_WRITE_FILE;
-    if (abi >= 3)
-        rw_file_access |= LANDLOCK_ACCESS_FS_TRUNCATE;
-    if (abi >= 5)
-        rw_file_access |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
-    rw_file_access &= abi_mask[abi - 1];
+        LANDLOCK_ACCESS_FS_WRITE_FILE |
+        LANDLOCK_ACCESS_FS_TRUNCATE |
+        LANDLOCK_ACCESS_FS_IOCTL_DEV;
+    __u64 rw_file_access = ruleset_attr.handled_access_fs & file_compat;
 
     /* 3c. Create the ruleset. */
     ruleset_fd = ll_create_ruleset(&ruleset_attr, sizeof(ruleset_attr), 0);
