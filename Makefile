@@ -1,6 +1,6 @@
 CC      ?= gcc
 CFLAGS  ?= -Wall -Wextra -O2
-PREFIX  ?= /usr/local
+PREFIX  ?= /usr
 CONFDIR ?= /etc/sysconfig
 
 TARGET = roam

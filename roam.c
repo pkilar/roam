@@ -2,7 +2,7 @@
  * roam.c — Read-Only Access Mode shell with sudo audit integration
  *
  * Designed to be invoked via:
- *   sudo -u roam /usr/local/sbin/roam
+ *   sudo -u roam /usr/sbin/roam
  *
  * Combines Landlock (filesystem read-only enforcement) with
  * CAP_DAC_READ_SEARCH (bypass read permission checks) to create
@@ -33,6 +33,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <syslog.h>
 #include <unistd.h>
 
 /* --- Constants --- */
@@ -479,6 +480,34 @@ int main(int argc, char *argv[])
             fprintf(stderr, "roam: note: landlock rule '%s': %s "
                     "(skipped)\n", cfg.writable[i], strerror(errno));
     }
+
+    /* Log session start to syslog before lockdown - syslog connects to
+     * /dev/log which may not be reachable after Landlock enforcement.
+     * Uses LOG_AUTHPRIV to route to /var/log/secure on RHEL (alongside
+     * sudo, sshd, etc.) rather than LOG_AUTH which goes to /var/log/messages. */
+    const char *sudo_user = getenv("SUDO_USER");
+    if (!sudo_user) sudo_user = "(unknown)";
+
+    char caps_str[128] = "";
+    int coff = 0;
+    if (cap_in_effective(CAP_DAC_READ_SEARCH))
+        coff += snprintf(caps_str + coff, sizeof(caps_str) - coff, "CAP_DAC_READ_SEARCH");
+    if (cap_in_effective(CAP_SETPCAP))
+        coff += snprintf(caps_str + coff, sizeof(caps_str) - coff, "%sCAP_SETPCAP", coff ? "," : "");
+    if (coff == 0) snprintf(caps_str, sizeof(caps_str), "none");
+
+    char writable_str[2048] = "";
+    int woff = 0;
+    for (int i = 0; i < cfg.writable_count; i++) {
+        int n = snprintf(writable_str + woff, sizeof(writable_str) - woff, "%s%s", i ? " ": "", cfg.writable[i]);
+        if (n < 0 || (size_t)(woff + n) >= sizeof(writable_str)) break;
+        woff += n;
+    }
+
+    openlog("roam", LOG_PID, LOG_AUTHPRIV);
+    syslog(LOG_INFO, "session opened: invoking_user=%s roam_user=%s caps=%s landlock_abi=v%d writable=%s", sudo_user,
+           cfg.user, caps_str, abi, writable_str);
+    closelog();
 
     /* ================================================================
      * PHASE 4: Lock down
