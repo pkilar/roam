@@ -64,7 +64,7 @@ sudo -u roam roam
 
 `make install` does the following:
 
-1. Installs the binary to `/usr/local/sbin/roam` (mode 0755)
+1. Installs the binary to `/usr/sbin/roam` (mode 0755)
 2. Sets file capabilities: `cap_dac_read_search,cap_setpcap+eip`
 3. Installs default config to `/etc/sysconfig/roam` (won't overwrite existing)
 4. Installs sudoers drop-in to `/etc/sudoers.d/roam` (won't overwrite existing)
@@ -79,8 +79,8 @@ useradd -r -m -s /sbin/nologin roam
 
 ```bash
 # Check file capabilities are set
-getcap /usr/local/sbin/roam
-# Expected: /usr/local/sbin/roam cap_dac_read_search,cap_setpcap=eip
+getcap /usr/sbin/roam
+# Expected: /usr/sbin/roam cap_dac_read_search,cap_setpcap=eip
 
 # Check the user exists
 id roam
@@ -114,7 +114,7 @@ ROAM_WRITABLE="/dev /proc /sys /run /tmp"
 Defaults:%wheel log_input, log_output
 
 # Allow wheel members to use roam without a password
-%wheel ALL=(roam) NOPASSWD: /usr/local/sbin/roam
+%wheel ALL=(roam) NOPASSWD: /usr/sbin/roam
 ```
 
 Adjust `%wheel` to match your environment (e.g., `%admins`, specific users).
@@ -144,7 +144,7 @@ sudo -u roam roam journalctl -u sshd --no-pager
 Add to your `~/.bashrc`:
 
 ```bash
-alias roam='sudo -u roam /usr/local/sbin/roam'
+alias roam='sudo -u roam /usr/sbin/roam'
 ```
 
 Then just:
@@ -169,7 +169,7 @@ fi
 ### How roam Runs
 
 ```
-sudo -u roam /usr/local/sbin/roam
+sudo -u roam /usr/sbin/roam
   |
   |-- Phase 1: Parse /etc/sysconfig/roam (validate root ownership)
   |-- Phase 2: Capability setup
@@ -235,9 +235,9 @@ File capabilities are lost when a binary is replaced. In your `.spec` file:
 
 ```spec
 %post
-setcap cap_dac_read_search,cap_setpcap+eip /usr/local/sbin/roam
+setcap cap_dac_read_search,cap_setpcap+eip /usr/sbin/roam
 
-%caps(cap_dac_read_search,cap_setpcap=eip) /usr/local/sbin/roam
+%caps(cap_dac_read_search,cap_setpcap=eip) /usr/sbin/roam
 ```
 
 ### SELinux
@@ -245,8 +245,8 @@ setcap cap_dac_read_search,cap_setpcap+eip /usr/local/sbin/roam
 On RHEL with SELinux enforcing, verify the binary's SELinux context allows file capabilities. If needed:
 
 ```bash
-semanage fcontext -a -t bin_t /usr/local/sbin/roam
-restorecon -v /usr/local/sbin/roam
+semanage fcontext -a -t bin_t /usr/sbin/roam
+restorecon -v /usr/sbin/roam
 ```
 
 ## Troubleshooting
@@ -255,14 +255,14 @@ restorecon -v /usr/local/sbin/roam
 
 File capabilities aren't set on the binary:
 ```bash
-sudo setcap cap_dac_read_search,cap_setpcap+eip /usr/local/sbin/roam
+sudo setcap cap_dac_read_search,cap_setpcap+eip /usr/sbin/roam
 ```
 
 ### "must run as 'roam'"
 
 You need to use sudo to switch users:
 ```bash
-sudo -u roam /usr/local/sbin/roam
+sudo -u roam /usr/sbin/roam
 ```
 
 ### "Landlock not supported by this kernel"
