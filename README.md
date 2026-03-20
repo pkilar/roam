@@ -285,6 +285,30 @@ sudo chown root:root /etc/sysconfig/roam
 sudo chmod 644 /etc/sysconfig/roam
 ```
 
+## Security Hardening
+
+### Minimum Kernel Version
+
+`roam` requires **Landlock ABI v3** (kernel 5.19+) for complete read-only enforcement. ABI v1/v2 cannot mediate `rename` and `truncate` operations, meaning files could be renamed or truncated despite the "read-only" sandbox. On ABI < 3, `roam` refuses to start by default. Set `ROAM_ALLOW_DEGRADED=1` in `/etc/sysconfig/roam` to override (not recommended for production).
+
+### Disable Unprivileged User Namespaces
+
+Unprivileged user namespaces allow creating new mount namespaces, which can potentially circumvent Landlock restrictions by bind-mounting over writable exception paths. On production servers, consider disabling them:
+
+```bash
+# Debian/Ubuntu
+sudo sysctl -w kernel.unprivileged_userns_clone=0
+
+# RHEL/General (kernel 6.1+)
+sudo sysctl -w user.max_user_namespaces=0
+```
+
+**Note**: This affects containerized workloads (Podman rootless, Flatpak, etc.). Evaluate impact before applying.
+
+### Inherited File Descriptors
+
+`roam` closes all inherited file descriptors (except stdin/stdout/stderr) before enforcing Landlock. This prevents bypass via `sudo --preserve-fds` or other FD-passing mechanisms.
+
 ## License
 
 MIT
