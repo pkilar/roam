@@ -19,6 +19,7 @@
  */
 
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -109,6 +110,50 @@ static char* canonicalize_path(const char* path, const char* what) {
   return resolved;
 }
 
+/* Reject home directories that would grant overly broad write access.
+ * A home of "/" makes the entire filesystem writable, defeating Landlock.
+ * Top-level system directories are similarly dangerous. */
+static int is_safe_home_path(const char* resolved) {
+  if (!resolved) return 0;
+  if (strcmp(resolved, "/") == 0) return 0;
+
+  static const char* const bad_paths[] = {
+      "/bin", "/boot", "/etc", "/lib", "/lib64", "/opt", "/sbin", "/usr", "/var", NULL,
+  };
+  for (const char* const* p = bad_paths; *p; p++) {
+    if (strcmp(resolved, *p) == 0) return 0;
+  }
+  return 1;
+}
+
+/* Close all file descriptors > 2 except the specified one.
+ * Prevents inherited writable FDs (e.g. via sudo --preserve-fds)
+ * from surviving into the Landlock-restricted shell. */
+static void sanitize_fds(int except_fd) {
+  DIR* d = opendir("/proc/self/fd");
+  if (!d) {
+    /* Fallback: brute-force close up to a reasonable limit. */
+    int max_fd = (int)sysconf(_SC_OPEN_MAX);
+    if (max_fd < 0) max_fd = 1024;
+    for (int i = 3; i < max_fd; i++) {
+      if (i != except_fd) close(i);
+    }
+    return;
+  }
+
+  int dir_fd = dirfd(d);
+  struct dirent* ent;
+  while ((ent = readdir(d)) != NULL) {
+    if (ent->d_name[0] == '.') continue;
+    int fd = atoi(ent->d_name);
+    if (fd <= 2) continue;      /* preserve stdin/stdout/stderr */
+    if (fd == dir_fd) continue; /* don't close the directory we're iterating */
+    if (fd == except_fd) continue;
+    close(fd);
+  }
+  closedir(d);
+}
+
 /* --- Configuration --- */
 
 struct config {
@@ -116,6 +161,7 @@ struct config {
   int writable_count;
   char* shell;
   char* user;
+  int allow_degraded; /* Allow Landlock ABI < 3 (incomplete read-only) */
 };
 
 static void config_add_paths(struct config* cfg, const char* paths) {
@@ -180,6 +226,8 @@ static void config_load(struct config* cfg) {
       free(cfg->user);
       cfg->user = strdup(val);
       if (!cfg->user) die("strdup");
+    } else if (strcmp(key, "ROAM_ALLOW_DEGRADED") == 0) {
+      cfg->allow_degraded = (strcmp(val, "1") == 0 || strcmp(val, "yes") == 0 || strcmp(val, "true") == 0);
     }
   }
   fclose(f);
@@ -258,10 +306,21 @@ int main(int argc, char* argv[]) {
     return EXIT_FAILURE;
   }
 
-  /* Always add the user's home as a writable exception. */
+  /* Add the user's home as a writable exception, but reject
+   * dangerous paths that would grant overly broad write access. */
   if (pw->pw_dir && pw->pw_dir[0] != '\0' && cfg.writable_count < MAX_WRITABLE) {
     char* home = canonicalize_path(pw->pw_dir, "home");
-    if (home) cfg.writable[cfg.writable_count++] = home;
+    if (home) {
+      if (is_safe_home_path(home)) {
+        cfg.writable[cfg.writable_count++] = home;
+      } else {
+        fprintf(stderr, "roam: SECURITY: home directory '%s' is too broad — skipping writable exception\n", home);
+        openlog("roam", LOG_PID, LOG_AUTHPRIV);
+        syslog(LOG_WARNING, "home directory '%s' rejected as writable exception (too broad)", home);
+        closelog();
+        free(home);
+      }
+    }
   }
 
   /* ================================================================
@@ -338,6 +397,29 @@ int main(int argc, char* argv[]) {
     return EXIT_FAILURE;
   }
   if (abi > 5) abi = 5;
+
+  /* Warn or fail if ABI is too old for full read-only enforcement.
+   * ABI v1: no REFER (cross-directory rename bypass)
+   * ABI v1-v2: no TRUNCATE (file truncation bypass)
+   * ABI v3+: full read-only enforcement. */
+  if (abi < 3) {
+    const char* missing = (abi < 2) ? "REFER (rename) and TRUNCATE" : "TRUNCATE";
+    fprintf(stderr,
+            "roam: WARNING: Landlock ABI v%d does not mediate %s operations.\n"
+            "  \"Read-only\" mode is incomplete — files may be truncated%s.\n"
+            "  Kernel 5.19+ (ABI v3) is required for full protection.\n",
+            abi, missing, (abi < 2) ? " or renamed" : "");
+    openlog("roam", LOG_PID, LOG_AUTHPRIV);
+    syslog(LOG_WARNING, "Landlock ABI v%d < 3: %s not mediated, read-only enforcement incomplete", abi, missing);
+    closelog();
+
+    if (!cfg.allow_degraded) {
+      fprintf(stderr, "roam: Refusing to start. Set ROAM_ALLOW_DEGRADED=1 in %s to override.\n", CONFIG_PATH);
+      config_free(&cfg);
+      return EXIT_FAILURE;
+    }
+    fprintf(stderr, "roam: Continuing in degraded mode (ROAM_ALLOW_DEGRADED=1).\n");
+  }
 
   /* ABI compatibility mask, from landlock(7). */
   static const __u64 abi_mask[] = {
@@ -447,8 +529,23 @@ int main(int argc, char* argv[]) {
          cfg.user, caps_str, abi, writable_str);
   closelog();
 
+  /* Close all inherited file descriptors except stdin/stdout/stderr
+   * and the Landlock ruleset fd.  Prevents write-through-inherited-fd
+   * attacks (e.g. sudo --preserve-fds).  Must happen AFTER syslog
+   * (which uses a socket to /dev/log) and config file parsing
+   * (already closed).  The ruleset fd is preserved for Phase 4. */
+  sanitize_fds(ruleset_fd);
+
   /* ================================================================
    * PHASE 4: Lock down
+   *
+   * NOTE: Unprivileged user namespaces allow creating mount namespaces
+   * where Landlock restrictions can be circumvented by bind-mounting
+   * over restricted paths.  Mitigate on the host with:
+   *   sysctl kernel.unprivileged_userns_clone=0   (Debian/Ubuntu)
+   *   sysctl user.max_user_namespaces=0            (RHEL/general)
+   * PR_SET_NO_NEW_PRIVS blocks setuid but does NOT block
+   * unshare(CLONE_NEWUSER).
    * ================================================================ */
 
   /* Prevent privilege escalation via setuid/setgid binaries.
