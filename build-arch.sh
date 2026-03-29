@@ -4,28 +4,40 @@
 #
 # Usage: ./build-arch.sh
 #
-# Requires: base-devel, linux-api-headers
+# Requires: base-devel, cargo, rust
 #
 set -euo pipefail
 
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || {
+        echo "Missing required command: $1" >&2
+        exit 1
+    }
+}
+
+need_cmd cargo
+need_cmd make
+need_cmd makepkg
+need_cmd rustc
+need_cmd tar
+
 NAME="roam"
-VERSION="1.0.0"
+VERSION="2.0.0"
 SRCDIR=$(cd "$(dirname "$0")" && pwd)
 
 # Create source tarball for makepkg.
-TMPDIR=$(mktemp -d)
-trap 'rm -rf "${TMPDIR}"' EXIT
-
-mkdir -p "${TMPDIR}/${NAME}-${VERSION}"
-cp "${SRCDIR}"/{roam.c,Makefile,roam.conf,roam.sudoers,README.md,LICENSE} \
-   "${TMPDIR}/${NAME}-${VERSION}/"
-
 BUILDDIR=$(mktemp -d)
-trap 'rm -rf "${TMPDIR}" "${BUILDDIR}"' EXIT
+trap 'rm -rf "${BUILDDIR}"' EXIT
 
 cp "${SRCDIR}/archpkg/PKGBUILD" "${BUILDDIR}/"
 tar czf "${BUILDDIR}/${NAME}-${VERSION}.tar.gz" \
-    -C "${TMPDIR}" "${NAME}-${VERSION}"
+    --exclude-vcs \
+    --transform "s,^,${NAME}-${VERSION}/," \
+    -C "${SRCDIR}" \
+    Cargo.toml Cargo.lock Makefile README.md ARCHITECTURE.md LICENSE \
+    roam.config.toml roam.policy.toml roam.sudoers \
+    build-rpm.sh build-deb.sh build-arch.sh \
+    archpkg debian crates
 
 # Update checksums and build.
 cd "${BUILDDIR}"

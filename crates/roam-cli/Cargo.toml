@@ -1,0 +1,12 @@
+[package]
+name = "roam"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc.workspace = true
+roam-broker = { path = "../roam-broker" }
+roam-core = { path = "../roam-core" }
+roam-sandbox = { path = "../roam-sandbox" }
+uuid.workspace = true

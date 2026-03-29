@@ -1,12 +1,23 @@
 #!/usr/bin/make -f
 
+export RUSTUP_TOOLCHAIN ?= stable
+
 %:
 	dh $@
 
 override_dh_auto_build:
-	$(MAKE) CC=gcc CFLAGS="$(CFLAGS) $(CPPFLAGS) $(LDFLAGS)"
+	$(MAKE) release
 
 override_dh_auto_install:
-	install -Dm0755 roam $(CURDIR)/debian/roam/usr/sbin/roam
-	install -Dm0644 roam.conf $(CURDIR)/debian/roam/etc/sysconfig/roam
+	install -Dm0755 target/release/roam $(CURDIR)/debian/roam/usr/sbin/roam
+	install -Dm0644 roam.config.toml $(CURDIR)/debian/roam/etc/roam/config.toml
+	install -Dm0644 roam.policy.toml $(CURDIR)/debian/roam/etc/roam/policy.toml
 	install -Dm0440 roam.sudoers $(CURDIR)/debian/roam/etc/sudoers.d/roam
+	install -Dm0644 README.md $(CURDIR)/debian/roam/usr/share/doc/roam/README.md
+	install -Dm0644 ARCHITECTURE.md $(CURDIR)/debian/roam/usr/share/doc/roam/ARCHITECTURE.md
+
+override_dh_auto_test:
+	$(MAKE) test
+
+override_dh_auto_clean:
+	$(MAKE) clean

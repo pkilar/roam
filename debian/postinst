@@ -8,15 +8,6 @@ case "$1" in
             adduser --system --group --home /home/roam \
                     --shell /sbin/nologin --gecos "Read-Only Access Mode" roam
         fi
-
-        # Set file capabilities on the binary.
-        if command -v setcap >/dev/null 2>&1; then
-            setcap cap_dac_read_search,cap_setpcap+eip /usr/sbin/roam || \
-                echo "WARNING: failed to set file capabilities on /usr/sbin/roam" >&2
-        else
-            echo "WARNING: setcap not found — install libcap2-bin and run:" >&2
-            echo "  setcap cap_dac_read_search,cap_setpcap+eip /usr/sbin/roam" >&2
-        fi
         ;;
 esac
 
