@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -12,11 +12,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use roam_core::protocol::{recv_frame, send_frame};
+use roam_core::unix::{lookup_group, lookup_passwd};
 use roam_core::{
-    path_matches_blacklist, BlockedPath, BrokerRequest, BrokerResponse, CommandOutcome,
-    EditInspection, EditProfile, EditStarted, Error, ExecProfile, Policy, Result, ServiceAction,
-    ServiceOutcome, SessionConfig, SessionMetadata, ValidatorOutcome, DEFAULT_CONFIG_PATH,
-    DEFAULT_POLICY_PATH,
+    path_matches_blacklist, syslog_info, BlockedPath, BrokerRequest, BrokerResponse,
+    CommandOutcome, EditInspection, EditProfile, EditStarted, Error, ExecProfile, Policy, Result,
+    ServiceAction, ServiceOutcome, SessionConfig, SessionMetadata, ValidatorOutcome,
+    DEFAULT_CONFIG_PATH, DEFAULT_POLICY_PATH,
 };
 use similar::TextDiff;
 
@@ -24,7 +25,6 @@ const SYSTEMCTL_PATH: &str = "/usr/bin/systemctl";
 const SUDO_PATH: &str = "/usr/bin/sudo";
 const BACKUP_ROOT: &str = "/var/lib/roam/backups";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
-const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 pub fn serve_fd(fd: RawFd, policy_path: &Path, metadata: SessionMetadata) -> Result<()> {
     let session_config = SessionConfig::load(DEFAULT_CONFIG_PATH)?;
@@ -53,7 +53,6 @@ struct EditTransaction {
     profile_name: String,
     profile: EditProfile,
     candidate_path: PathBuf,
-    target_path: PathBuf,
 }
 
 impl Broker {
@@ -77,10 +76,7 @@ impl Broker {
         syslog_info(&format!(
             "broker started: session_id={} invoking_user={} session_user={}",
             metadata.session_id,
-            metadata
-                .invoking_user
-                .clone()
-                .unwrap_or_else(|| "(unknown)".to_string()),
+            metadata.invoking_user.as_deref().unwrap_or("(unknown)"),
             metadata.session_user
         ));
 
@@ -113,7 +109,7 @@ impl Broker {
         }
 
         let _ = fs::remove_dir_all(&self.work_dir);
-        let _ = fs::remove_dir_all(session_runtime_root(&self.metadata));
+        let _ = fs::remove_dir_all(self.metadata.runtime_root());
         syslog_info(&format!(
             "broker exited: session_id={}",
             self.metadata.session_id
@@ -167,19 +163,20 @@ impl Broker {
             self.metadata.session_gid,
         )?;
 
+        let target_path = profile.path.clone();
+
         self.edits.insert(
             ticket.clone(),
             EditTransaction {
                 profile_name: profile_name.to_string(),
-                profile: profile.clone(),
+                profile,
                 candidate_path: candidate_path.clone(),
-                target_path: profile.path.clone(),
             },
         );
 
         Ok(BrokerResponse::EditStarted(EditStarted {
             ticket,
-            target_path: profile.path,
+            target_path,
             candidate_path,
         }))
     }
@@ -190,15 +187,21 @@ impl Broker {
             .get(ticket)
             .ok_or_else(|| Error::Rejected(format!("unknown edit ticket '{ticket}'")))?;
 
-        let current = read_lossy(&txn.target_path)?;
-        let candidate = read_lossy(&txn.candidate_path)?;
-        let changed = file_changed(&txn.target_path, &txn.candidate_path)?;
+        let current_bytes = match fs::read(&txn.profile.path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => return Err(err.into()),
+        };
+        let candidate_bytes = fs::read(&txn.candidate_path)?;
+        let changed = current_bytes != candidate_bytes;
         let diff = if changed {
-            TextDiff::from_lines(&current, &candidate)
+            let current = String::from_utf8_lossy(&current_bytes);
+            let candidate = String::from_utf8_lossy(&candidate_bytes);
+            TextDiff::from_lines(current.as_ref(), candidate.as_ref())
                 .unified_diff()
                 .context_radius(3)
                 .header(
-                    &txn.target_path.display().to_string(),
+                    &txn.profile.path.display().to_string(),
                     &txn.candidate_path.display().to_string(),
                 )
                 .to_string()
@@ -220,7 +223,7 @@ impl Broker {
             .remove(ticket)
             .ok_or_else(|| Error::Rejected(format!("unknown edit ticket '{ticket}'")))?;
 
-        let changed = file_changed(&txn.target_path, &txn.candidate_path)?;
+        let changed = file_changed(&txn.profile.path, &txn.candidate_path)?;
         if !changed {
             let _ = fs::remove_file(&txn.candidate_path);
             return Err(Error::Rejected("candidate has no changes".to_string()));
@@ -242,7 +245,7 @@ impl Broker {
             "edit committed: session_id={} profile={} target={} backup={}",
             self.metadata.session_id,
             txn.profile_name,
-            txn.target_path.display(),
+            txn.profile.path.display(),
             backup_path.display()
         ));
 
@@ -356,10 +359,7 @@ impl Broker {
         syslog_info(&format!(
             "sudo passthrough: session_id={} invoking_user={} argv={}",
             self.metadata.session_id,
-            self.metadata
-                .invoking_user
-                .clone()
-                .unwrap_or_else(|| "(unknown)".to_string()),
+            self.metadata.invoking_user.as_deref().unwrap_or("(unknown)"),
             argv.join(" ")
         ));
 
@@ -368,15 +368,16 @@ impl Broker {
 }
 
 fn install_candidate(txn: &EditTransaction, metadata: &SessionMetadata) -> Result<PathBuf> {
-    let parent = txn.target_path.parent().ok_or_else(|| {
+    let parent = txn.profile.path.parent().ok_or_else(|| {
         Error::Rejected(format!(
             "{} has no parent directory",
-            txn.target_path.display()
+            txn.profile.path.display()
         ))
     })?;
 
     let file_name = txn
-        .target_path
+        .profile
+        .path
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or_else(|| Error::Rejected("target path must have a file name".to_string()))?;
@@ -393,19 +394,19 @@ fn install_candidate(txn: &EditTransaction, metadata: &SessionMetadata) -> Resul
     fs::set_permissions(&temp_path, fs::Permissions::from_mode(mode))?;
     fsync_file(&temp_path)?;
 
-    if txn.target_path.exists() {
-        fs::copy(&txn.target_path, &backup_path)?;
+    if txn.profile.path.exists() {
+        fs::copy(&txn.profile.path, &backup_path)?;
     } else {
         File::create(&backup_path)?;
     }
 
-    fs::rename(&temp_path, &txn.target_path)?;
+    fs::rename(&temp_path, &txn.profile.path)?;
     fsync_dir(parent)?;
     Ok(backup_path)
 }
 
 fn install_owner_group_mode(txn: &EditTransaction) -> Result<(u32, u32, u32)> {
-    let metadata = fs::metadata(&txn.target_path).ok();
+    let metadata = fs::metadata(&txn.profile.path).ok();
 
     let uid = txn
         .profile
@@ -609,6 +610,7 @@ fn wait_for_child(
     timed_out: &mut bool,
 ) -> Result<std::process::ExitStatus> {
     let start = Instant::now();
+    let mut poll_interval = Duration::from_millis(10);
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(status);
@@ -618,7 +620,8 @@ fn wait_for_child(
             let _ = child.kill();
             return Ok(child.wait()?);
         }
-        thread::sleep(COMMAND_POLL_INTERVAL);
+        thread::sleep(poll_interval);
+        poll_interval = (poll_interval * 2).min(Duration::from_millis(200));
     }
 }
 
@@ -627,14 +630,6 @@ fn read_command_output(path: &Path) -> Result<String> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-fn read_lossy(path: &Path) -> Result<String> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(err) => Err(err.into()),
-    }
 }
 
 fn file_changed(target_path: &Path, candidate_path: &Path) -> Result<bool> {
@@ -705,94 +700,6 @@ fn groups_for_user(name: &str, primary_gid: u32) -> Result<Vec<u32>> {
     }
 }
 
-struct PasswdRecord {
-    uid: u32,
-    gid: u32,
-}
-
-struct GroupRecord {
-    gid: u32,
-}
-
-fn lookup_passwd(name: &CStr) -> Result<Option<PasswdRecord>> {
-    let mut buf_len = initial_r_buffer_size(libc::_SC_GETPW_R_SIZE_MAX);
-    loop {
-        let mut passwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
-        let mut buffer = vec![0u8; buf_len];
-        let mut result = std::ptr::null_mut();
-
-        // SAFETY: passwd points to valid storage, buffer is writable, and name is a valid C string.
-        let rc = unsafe {
-            libc::getpwnam_r(
-                name.as_ptr(),
-                passwd.as_mut_ptr(),
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-                &mut result,
-            )
-        };
-        if rc == 0 {
-            if result.is_null() {
-                return Ok(None);
-            }
-            // SAFETY: result is non-null and points to initialized passwd storage.
-            let passwd = unsafe { passwd.assume_init() };
-            return Ok(Some(PasswdRecord {
-                uid: passwd.pw_uid,
-                gid: passwd.pw_gid,
-            }));
-        }
-        if rc == libc::ERANGE {
-            buf_len *= 2;
-            continue;
-        }
-        return Err(std::io::Error::from_raw_os_error(rc).into());
-    }
-}
-
-fn lookup_group(name: &CStr) -> Result<Option<GroupRecord>> {
-    let mut buf_len = initial_r_buffer_size(libc::_SC_GETGR_R_SIZE_MAX);
-    loop {
-        let mut group = std::mem::MaybeUninit::<libc::group>::uninit();
-        let mut buffer = vec![0u8; buf_len];
-        let mut result = std::ptr::null_mut();
-
-        // SAFETY: group points to valid storage, buffer is writable, and name is a valid C string.
-        let rc = unsafe {
-            libc::getgrnam_r(
-                name.as_ptr(),
-                group.as_mut_ptr(),
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-                &mut result,
-            )
-        };
-        if rc == 0 {
-            if result.is_null() {
-                return Ok(None);
-            }
-            // SAFETY: result is non-null and points to initialized group storage.
-            let group = unsafe { group.assume_init() };
-            return Ok(Some(GroupRecord { gid: group.gr_gid }));
-        }
-        if rc == libc::ERANGE {
-            buf_len *= 2;
-            continue;
-        }
-        return Err(std::io::Error::from_raw_os_error(rc).into());
-    }
-}
-
-fn initial_r_buffer_size(sysconf_name: libc::c_int) -> usize {
-    // SAFETY: sysconf only reads the provided name constant.
-    let size = unsafe { libc::sysconf(sysconf_name) };
-    if size <= 0 {
-        16 * 1024
-    } else {
-        size as usize
-    }
-}
-
 fn fsync_file(path: &Path) -> Result<()> {
     let file = File::options().read(true).open(path)?;
     file.sync_all()?;
@@ -803,25 +710,6 @@ fn fsync_dir(path: &Path) -> Result<()> {
     let dir = File::options().read(true).open(path)?;
     dir.sync_all()?;
     Ok(())
-}
-
-fn syslog_info(message: &str) {
-    let ident = CString::new("roam").expect("static string");
-    let Ok(message) = CString::new(message) else {
-        return;
-    };
-    // SAFETY: static and stack CStrings remain valid for the duration of the calls.
-    unsafe {
-        libc::openlog(ident.as_ptr(), libc::LOG_PID, libc::LOG_AUTHPRIV);
-        libc::syslog(libc::LOG_INFO, c"%s".as_ptr(), message.as_ptr());
-        libc::closelog();
-    }
-}
-
-fn session_runtime_root(metadata: &SessionMetadata) -> PathBuf {
-    let mut path = std::env::temp_dir();
-    path.push(format!("roam-shell-{}", metadata.session_id));
-    path
 }
 
 #[cfg(test)]

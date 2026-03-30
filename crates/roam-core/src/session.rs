@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -32,6 +33,12 @@ impl SessionMetadata {
             session_uid,
             session_gid,
         }
+    }
+
+    pub fn runtime_root(&self) -> PathBuf {
+        let mut path = env::temp_dir();
+        path.push(format!("roam-shell-{}", self.session_id));
+        path
     }
 }
 
