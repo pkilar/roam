@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use roam_core::config::{canonicalize_path, is_safe_home_path};
-use roam_core::{BlockedPath, BlockedPathKind, Error, Result, SessionConfig, SessionMetadata};
+use roam_core::{
+    syslog_info, BlockedPath, BlockedPathKind, Error, Result, SessionConfig, SessionMetadata,
+    SessionUser,
+};
 
 const CAP_DAC_READ_SEARCH: u32 = 2;
 const CAP_SETPCAP: u32 = 8;
@@ -66,96 +69,9 @@ struct LandlockPathBeneathAttr {
     parent_fd: i32,
 }
 
-#[derive(Clone, Debug)]
-pub struct SessionUser {
-    pub name: String,
-    pub uid: u32,
-    pub gid: u32,
-    pub home: Option<PathBuf>,
-}
-
-pub fn lookup_user(name: &str) -> Result<SessionUser> {
-    let c_name =
-        CString::new(name).map_err(|_| Error::Config(format!("invalid user name '{name}'")))?;
-    let passwd = lookup_passwd(&c_name)
-        .map_err(|err| Error::Config(format!("failed to resolve user '{name}': {err}")))?
-        .ok_or_else(|| Error::Config(format!("user '{name}' not found")))?;
-    let home = if passwd.home.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(passwd.home))
-    };
-    Ok(SessionUser {
-        name: name.to_string(),
-        uid: passwd.uid,
-        gid: passwd.gid,
-        home,
-    })
-}
-
-struct PasswdRecord {
-    uid: u32,
-    gid: u32,
-    home: String,
-}
-
-fn lookup_passwd(name: &CStr) -> Result<Option<PasswdRecord>> {
-    let mut buf_len = initial_r_buffer_size(libc::_SC_GETPW_R_SIZE_MAX);
-    loop {
-        let mut passwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
-        let mut buffer = vec![0u8; buf_len];
-        let mut result = std::ptr::null_mut();
-
-        // SAFETY: passwd points to valid storage, buffer is writable, and name is a valid C string.
-        let rc = unsafe {
-            libc::getpwnam_r(
-                name.as_ptr(),
-                passwd.as_mut_ptr(),
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-                &mut result,
-            )
-        };
-        if rc == 0 {
-            if result.is_null() {
-                return Ok(None);
-            }
-            // SAFETY: result is non-null and points to the passwd struct filled by getpwnam_r.
-            let passwd = unsafe { passwd.assume_init() };
-            let home = if passwd.pw_dir.is_null() {
-                String::new()
-            } else {
-                // SAFETY: pw_dir points into buffer for the lifetime of this scope; we copy it out.
-                unsafe { CStr::from_ptr(passwd.pw_dir) }
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            return Ok(Some(PasswdRecord {
-                uid: passwd.pw_uid,
-                gid: passwd.pw_gid,
-                home,
-            }));
-        }
-        if rc == libc::ERANGE {
-            buf_len *= 2;
-            continue;
-        }
-        return Err(std::io::Error::from_raw_os_error(rc).into());
-    }
-}
-
-fn initial_r_buffer_size(sysconf_name: libc::c_int) -> usize {
-    // SAFETY: sysconf only reads the provided name constant.
-    let size = unsafe { libc::sysconf(sysconf_name) };
-    if size <= 0 {
-        16 * 1024
-    } else {
-        size as usize
-    }
-}
-
 pub fn run_session(
     config: &SessionConfig,
+    user: &SessionUser,
     metadata: &SessionMetadata,
     broker_fd: RawFd,
     broker_lock_fd: RawFd,
@@ -167,11 +83,10 @@ pub fn run_session(
         ));
     }
 
-    let user = lookup_user(&config.user)?;
-    let writable = build_writable_paths(config, &user);
+    let writable = build_writable_paths(config, user);
 
     apply_blacklist(&config.blacklist)?;
-    drop_privileges(&user)?;
+    drop_privileges(user)?;
     configure_capabilities()?;
 
     let abi = detect_landlock_abi()?;
@@ -657,7 +572,7 @@ fn exec_shell(shell: &Path, command: &[String], metadata: &SessionMetadata) -> R
 }
 
 fn exec_bash_shell(shell: &Path, login_name: &str, metadata: &SessionMetadata) -> std::io::Error {
-    let runtime_root = session_runtime_root(metadata);
+    let runtime_root = metadata.runtime_root();
     if let Err(err) = fs::create_dir_all(&runtime_root) {
         return err;
     }
@@ -680,7 +595,7 @@ fn exec_bash_shell(shell: &Path, login_name: &str, metadata: &SessionMetadata) -
 }
 
 fn exec_zsh_shell(shell: &Path, login_name: &str, metadata: &SessionMetadata) -> std::io::Error {
-    let zdotdir = session_runtime_root(metadata).join("zsh");
+    let zdotdir = metadata.runtime_root().join("zsh");
     if let Err(err) = fs::create_dir_all(&zdotdir) {
         return err;
     }
@@ -746,38 +661,20 @@ fn zsh_source_file(name: &str, add_alias: bool) -> String {
     contents
 }
 
-fn session_runtime_root(metadata: &SessionMetadata) -> PathBuf {
-    let mut path = env::temp_dir();
-    path.push(format!("roam-shell-{}", metadata.session_id));
-    path
-}
-
 fn log_session_open(metadata: &SessionMetadata, abi: i32, writable: &[PathBuf]) {
     let joined = writable
         .iter()
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>()
         .join(" ");
-    let ident = CString::new("roam").expect("static");
-    let message = CString::new(format!(
+    syslog_info(&format!(
         "session opened: session_id={} invoking_user={} roam_user={} landlock_abi=v{} writable={}",
         metadata.session_id,
-        metadata
-            .invoking_user
-            .clone()
-            .unwrap_or_else(|| "(unknown)".to_string()),
+        metadata.invoking_user.as_deref().unwrap_or("(unknown)"),
         metadata.session_user,
         abi,
         joined
-    ))
-    .expect("no interior NUL");
-
-    // SAFETY: valid C strings for the duration of the call.
-    unsafe {
-        libc::openlog(ident.as_ptr(), libc::LOG_PID, libc::LOG_AUTHPRIV);
-        libc::syslog(libc::LOG_INFO, c"%s".as_ptr(), message.as_ptr());
-        libc::closelog();
-    }
+    ));
 }
 
 fn open_path(path: &Path) -> Result<RawFd> {

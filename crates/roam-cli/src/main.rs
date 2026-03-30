@@ -10,10 +10,10 @@ use std::process::{Command, Stdio};
 use roam_broker::serve_fd;
 use roam_core::protocol::{recv_frame, send_frame};
 use roam_core::{
-    BrokerRequest, BrokerResponse, Error, Result, ServiceAction, SessionConfig, SessionMetadata,
-    DEFAULT_CONFIG_PATH, DEFAULT_POLICY_PATH,
+    lookup_user, BrokerRequest, BrokerResponse, Error, Result, ServiceAction, SessionConfig,
+    SessionMetadata, DEFAULT_CONFIG_PATH, DEFAULT_POLICY_PATH,
 };
-use roam_sandbox::{lookup_user, run_session};
+use roam_sandbox::run_session;
 
 const BROKER_FD: RawFd = 3;
 
@@ -77,7 +77,7 @@ fn run_shell(command: Vec<String>) -> Result<()> {
     let lock_fd = create_lock_fd()?;
 
     spawn_broker(&metadata, server, Path::new(DEFAULT_POLICY_PATH))?;
-    run_session(&config, &metadata, client.into_raw_fd(), lock_fd, &command)
+    run_session(&config, &session_user, &metadata, client.into_raw_fd(), lock_fd, &command)
 }
 
 fn run_broker() -> Result<()> {

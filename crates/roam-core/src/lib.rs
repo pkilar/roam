@@ -3,6 +3,7 @@ pub mod error;
 pub mod policy;
 pub mod protocol;
 pub mod session;
+pub mod unix;
 
 pub use config::{
     path_matches_blacklist, BlockedPath, BlockedPathKind, SessionConfig, DEFAULT_CONFIG_PATH,
@@ -18,3 +19,4 @@ pub use protocol::{
     ValidatorOutcome,
 };
 pub use session::SessionMetadata;
+pub use unix::{lookup_user, syslog_info, SessionUser};
