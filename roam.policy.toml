@@ -1,0 +1,42 @@
+# /etc/roam/policy.toml
+#
+# Security: this file controls privileged broker actions.
+# It must be owned by root and must not be group/world-writable.
+
+[edit.sshd_config]
+path = "/etc/ssh/sshd_config"
+owner = "root"
+group = "root"
+mode = 0o600
+validator = ["/usr/sbin/sshd", "-t", "-f", "{candidate}"]
+
+[edit.sudoers_roam]
+path = "/etc/sudoers.d/roam"
+owner = "root"
+group = "root"
+mode = 0o440
+validator = ["/usr/sbin/visudo", "-c", "-f", "{candidate}"]
+
+[service.sshd]
+unit = "sshd.service"
+actions = ["status", "restart", "reload"]
+
+[service.systemd_journald]
+unit = "systemd-journald.service"
+actions = ["status", "restart"]
+
+[exec.journalctl]
+program = "/usr/bin/journalctl"
+args = ["--no-pager"]
+allow_extra_args = true
+
+[exec.systemctl_status]
+program = "/usr/bin/systemctl"
+args = ["status"]
+allow_extra_args = true
+
+# Break-glass path. When enabled, `roam sudo-passthrough -- <cmd> ...`
+# re-enters `/usr/bin/sudo -n` under the original invoking user identity and
+# relies on the host sudoers policy for authorization.
+[sudo_passthrough]
+enabled = false

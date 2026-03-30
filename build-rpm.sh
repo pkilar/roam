@@ -4,12 +4,25 @@
 #
 # Usage: ./build-rpm.sh
 #
-# Requires: rpm-build, gcc, make, kernel-headers
+# Requires: cargo, rustc, rpm-build, make
 #
 set -euo pipefail
 
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || {
+        echo "Missing required command: $1" >&2
+        exit 1
+    }
+}
+
+need_cmd cargo
+need_cmd make
+need_cmd rpmbuild
+need_cmd rustc
+need_cmd tar
+
 NAME="roam"
-VERSION="1.0.0"
+VERSION="2.0.0"
 TARBALL="${NAME}-${VERSION}.tar.gz"
 
 # Set up rpmbuild directory structure.
@@ -18,15 +31,14 @@ mkdir -p "${RPMBUILD}"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
 
 # Create source tarball with the expected directory prefix.
 SRCDIR=$(cd "$(dirname "$0")" && pwd)
-TMPDIR=$(mktemp -d)
-trap 'rm -rf "${TMPDIR}"' EXIT
-
-mkdir -p "${TMPDIR}/${NAME}-${VERSION}"
-cp "${SRCDIR}"/{roam.c,Makefile,roam.conf,roam.sudoers,README.md,LICENSE} \
-   "${TMPDIR}/${NAME}-${VERSION}/"
-
 tar czf "${RPMBUILD}/SOURCES/${TARBALL}" \
-    -C "${TMPDIR}" "${NAME}-${VERSION}"
+    --exclude-vcs \
+    --transform "s,^,${NAME}-${VERSION}/," \
+    -C "${SRCDIR}" \
+    Cargo.toml Cargo.lock Makefile README.md ARCHITECTURE.md LICENSE \
+    roam.config.toml roam.policy.toml roam.sudoers \
+    build-rpm.sh build-deb.sh build-arch.sh \
+    archpkg debian crates
 
 # Copy spec file.
 cp "${SRCDIR}/roam.spec" "${RPMBUILD}/SPECS/"

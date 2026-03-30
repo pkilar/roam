@@ -1,76 +1,108 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code when working in this repository.
 
 ## Project Overview
 
-`roam` (Read-Only Access Mode) is a Linux security utility that creates a sandboxed shell with read-only filesystem access. It runs as a dedicated non-root user via `sudo -u roam`, uses `CAP_DAC_READ_SEARCH` (from file capabilities) to read all files, Landlock LSM for write protection, and sudo session logging for audit.
+`roam` is now a Rust workspace. It launches a read-only troubleshooting shell under the dedicated `roam` user while a root-owned per-session broker handles approved edits, exec profiles, service actions, and the optional `sudo_passthrough` break-glass path.
 
-## Build
+The current runtime model is:
 
-```bash
-make                # builds roam
-make clean          # removes build artifacts
-make install        # installs binary, config, sudoers (requires root)
-make install-user   # creates the 'roam' system user
-make uninstall      # removes binary
-```
+1. `sudo /usr/sbin/roam shell`
+2. Root launcher loads `/etc/roam/config.toml` and `/etc/roam/policy.toml`
+3. Root broker process starts with a private session socket
+4. Session child creates a private mount namespace, overmounts blacklisted paths, drops to `roam`, restores `CAP_DAC_READ_SEARCH`, applies Landlock, and execs the shell
+5. In-session `roam edit`, `roam exec`, `roam service`, and `roam sudo-passthrough` commands talk to the broker over inherited FDs
 
-No external dependencies beyond Linux kernel headers (`linux/landlock.h`, requires kernel 5.13+). No libcap — all capability operations use raw `capget`/`capset`/`prctl` syscalls.
+No file capabilities are installed on the final binary anymore.
 
-### Packaging
+## Workspace Layout
 
-```bash
-./build-rpm.sh      # builds RPM package (uses roam.spec)
-./build-deb.sh      # builds Debian package (uses debian/)
-./build-arch.sh     # builds Arch package (uses archpkg/PKGBUILD)
-```
+- `crates/roam-cli`: user-facing binary and session commands
+- `crates/roam-sandbox`: privilege drop, capabilities, Landlock, mount namespace setup
+- `crates/roam-broker`: per-session root broker for approved edits, exec profiles, service actions, and sudo passthrough
+- `crates/roam-core`: shared config, policy, protocol, session metadata, and errors
 
-File capabilities (`setcap`) are set in `%post`/`postinst` scripts because packaging tools strip xattrs during build.
-
-## Code Style
-
-`.clang-format`: Google style, 120 column limit.
-
-## Architecture
-
-### roam.c (~510 lines, single file)
-
-Five-phase execution model, invoked via `sudo -u roam /usr/sbin/roam`:
-
-1. **Configuration** — Parses `/etc/sysconfig/roam` (validates root ownership, no group/world-write). Settings: `ROAM_USER`, `ROAM_WRITABLE`, `ROAM_SHELL`. User's home dir is always added as writable.
-2. **Capability setup** — Adds `CAP_DAC_READ_SEARCH` to inheritable set, raises it as ambient (so it survives exec), clears bounding set except `CAP_DAC_READ_SEARCH` (requires `CAP_SETPCAP` from file caps), drops `CAP_SETPCAP`. **Must happen before `PR_SET_NO_NEW_PRIVS`.**
-3. **Landlock setup** — ABI detection (v1-v5), read-only ruleset on `/`, writable exceptions from config. Uses `fstat()` to select file-compatible vs directory access masks (Landlock rejects directory-only rights on file fds).
-4. **Lock down** — `PR_SET_NO_NEW_PRIVS` + `landlock_restrict_self`. Syslog session start is logged just before this phase (syslog connects to `/dev/log` which may not be reachable after Landlock enforcement). Uses `LOG_AUTHPRIV` to route to `/var/log/secure` on RHEL.
-5. **Exec shell** — Login shell via `argv[0]` prefix convention (`-bash`). Sets `ROAM=1` env var. If `argc > 1`, runs argv as a command instead. All child processes inherit `CAP_DAC_READ_SEARCH` via ambient caps.
-
-**File capabilities required on the binary:**
-```bash
-setcap cap_dac_read_search,cap_setpcap+eip /usr/sbin/roam
-```
-
-### Configuration: /etc/sysconfig/roam
+## Build and Test
 
 ```bash
-ROAM_USER="roam"                        # dedicated non-root user
-ROAM_WRITABLE="/dev /proc /sys /run /tmp" # writable path exceptions
-# ROAM_SHELL="/bin/bash"                  # shell override
+make          # cargo build --workspace --release --bins
+make check    # cargo check --workspace
+make test     # cargo test --workspace
+make fmt      # cargo fmt --all
+make clippy   # cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Virtual/pseudo filesystems (`/dev`, `/proc`, `/sys`, `/run`) are listed as writable exceptions because POSIX permissions already prevent the non-root `roam` user from writing to them. This avoids Landlock edge cases with device files while adding no security risk.
+Install locally with:
 
-### Sudoers: /etc/sudoers.d/roam
-
-```
-Defaults:%wheel log_input, log_output
-%wheel ALL=(roam) NOPASSWD: /usr/sbin/roam
+```bash
+sudo make install-user
+sudo make install
 ```
 
-## Key Design Details
+## Packaging
 
-- The `abi_mask[]` array maps ABI versions to bitmasks — each entry is `(highest_flag_for_version << 1) - 1`. This is the standard compatibility pattern from `landlock(7)`.
-- `LANDLOCK_ACCESS_FS_TRAVERSE` is implicitly included in allowed access (not declared in `handled_access_fs`) — Landlock only restricts access types that are explicitly handled.
-- The program never forks; it directly `exec`s into the target shell/command, so Landlock restrictions and ambient capabilities carry forward.
-- **Capability ordering is critical**: ambient caps must be raised before `PR_SET_NO_NEW_PRIVS`, because some kernels block `PR_CAP_AMBIENT_RAISE` afterward. The bounding set must retain `CAP_DAC_READ_SEARCH` for ambient caps to survive exec.
-- The config file undergoes security validation (root-owned, no group/world-write) to prevent a local user from injecting writable path exceptions.
-- All capability manipulation uses raw syscalls (`__NR_capget`/`__NR_capset`) — there is no libcap dependency. The `cap_set_epi()` helper sets all three capability sets (effective, permitted, inheritable) in a single `capset` call.
+- RPM: `roam.spec`, `make rpm`
+- Debian: `debian/`, `make deb`
+- Arch: `archpkg/PKGBUILD`, `make arch`
+
+All package definitions should stay aligned with:
+
+- installed binary path: `/usr/sbin/roam`
+- session config: `/etc/roam/config.toml`
+- broker policy: `/etc/roam/policy.toml`
+- sudoers file: `/etc/sudoers.d/roam`
+
+## Configuration
+
+`/etc/roam/config.toml` supports:
+
+- `user`
+- `writable`
+- `blacklist`
+- `blacklist_glob`
+- `allow_degraded`
+- `shell`
+
+`/etc/roam/policy.toml` contains allowlisted edit, exec, and service profiles plus the optional `sudo_passthrough` enable flag. Keep the profile-based paths strict.
+The policy file is security-sensitive and must stay root-owned and not group/world-writable; the loader now enforces that.
+
+## Important Design Constraints
+
+- The read-only shell must stay read-only for normal session processes.
+- Blacklist enforcement is real, not cosmetic: the session overmounts blocked paths before privilege drop.
+- The broker must keep the profile-based paths structured. `sudo_passthrough` is the explicit break-glass exception.
+- `roam edit` uses `sudoedit`-style temp copies, diff/validation, and atomic install.
+- `roam exec` runs absolute program paths from named profiles and only appends extra args when the profile allows it.
+- `roam service` is restricted to allowlisted profiles and `status` / `restart` / `reload`.
+- `roam sudo-passthrough` must stay non-interactive and go through `/usr/bin/sudo -n` under the original invoking identity.
+- Interactive `bash` and `zsh` sessions expose `alias sudo='roam sudo-passthrough'`, but broker-side policy still rejects it unless `[sudo_passthrough] enabled = true`. Treat it as a command shortcut, not a full host `sudo` CLI emulation.
+- Broker child commands are bounded by a 30 second timeout so one hung validator or profile command cannot wedge the session forever.
+- Any change to session config parsing should be mirrored in broker behavior if it affects privileged actions.
+
+## Versioning
+
+For the Rust rewrite, use `2.x` or higher so package-manager upgrades from the older `1.0.0` C release line work normally.
+When bumping the release version, update these files together:
+
+- `Cargo.toml`
+- `roam.spec`
+- `archpkg/PKGBUILD`
+- `debian/changelog`
+- `build-rpm.sh`
+- `build-arch.sh`
+
+## Manual Verification Priorities
+
+When changing security-sensitive code, prefer these checks after build:
+
+```bash
+sudo roam shell /usr/bin/true
+sudo roam shell cat /etc/hostname
+sudo roam shell sh -lc 'touch /etc/should-fail'
+sudo roam shell roam service status sshd
+sudo roam shell roam exec journalctl -u sshd -n 20
+sudo roam shell roam edit sshd_config
+```
+
+If a root-required smoke test cannot be run in the current environment, state that explicitly.

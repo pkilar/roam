@@ -1,0 +1,38 @@
+# /etc/roam/config.toml
+#
+# Security: this file controls the sandbox session configuration.
+# It must be owned by root and must not be group/world-writable.
+
+# Session user for the read-only shell.
+# Create with: useradd -r -m -s /sbin/nologin roam
+# user = "roam"
+
+# Writable path exceptions.
+# These paths get full read+write access inside the Landlock sandbox.
+# The user's home directory ($HOME of the configured user) is added
+# automatically when it is considered safe.
+#
+# writable = ["/dev", "/proc", "/sys", "/run", "/tmp"]
+
+# Blacklisted paths.
+# File-like paths are overmounted so their contents cannot be read.
+# Directory paths hide the full subtree. The broker also rejects edits
+# that target blacklisted paths.
+#
+# blacklist = ["/etc/shadow", "/dev/sda", "/var/lib/secret-data"]
+
+# Glob-style blacklist patterns, expanded to concrete paths when a
+# session starts.
+#
+# blacklist_glob = ["/dev/sd[a-z]", "/etc/*.key", "/var/lib/app/**/*.pem"]
+
+# Allow running with Landlock ABI < 3 (degraded mode).
+# ABI v1/v2 cannot mediate rename/truncate, so "read-only" is incomplete.
+# Default: false
+#
+# allow_degraded = false
+
+# Optional shell override.
+# Default: /bin/bash
+#
+# shell = "/bin/bash"

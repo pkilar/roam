@@ -1,47 +1,36 @@
 # Maintainer: Paul Kilar <pkilar@gmail.com>
 pkgname=roam
-pkgver=1.0.0
+pkgver=2.0.0
 pkgrel=1
 pkgdesc="Read-Only Access Mode - safe troubleshooting shell"
 arch=('x86_64' 'aarch64')
 url="https://github.com/pkilar/roam"
 license=('MIT')
-depends=('sudo' 'libcap')
-makedepends=('gcc' 'linux-api-headers')
-backup=('etc/sysconfig/roam' 'etc/sudoers.d/roam')
+depends=('sudo')
+makedepends=('cargo' 'rust' 'make')
+backup=('etc/roam/config.toml' 'etc/roam/policy.toml' 'etc/sudoers.d/roam')
 source=("$pkgname-$pkgver.tar.gz")
 sha256sums=('SKIP')
 
 build() {
     cd "$pkgname-$pkgver"
-    make CC=gcc CFLAGS="$CFLAGS"
+    export RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-stable}"
+    make release
 }
 
 package() {
     cd "$pkgname-$pkgver"
 
-    install -Dm0755 roam "$pkgdir/usr/sbin/roam"
-    install -Dm0644 roam.conf "$pkgdir/etc/sysconfig/roam"
+    install -Dm0755 target/release/roam "$pkgdir/usr/sbin/roam"
+    install -Dm0644 roam.config.toml "$pkgdir/etc/roam/config.toml"
+    install -Dm0644 roam.policy.toml "$pkgdir/etc/roam/policy.toml"
     install -Dm0440 roam.sudoers "$pkgdir/etc/sudoers.d/roam"
     install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
     install -Dm0644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm0644 ARCHITECTURE.md "$pkgdir/usr/share/doc/$pkgname/ARCHITECTURE.md"
 
     # systemd-sysusers for creating the roam user
     install -Dm0644 /dev/stdin "$pkgdir/usr/lib/sysusers.d/roam.conf" <<EOF
 u roam - "Read-Only Access Mode" /home/roam /sbin/nologin
-EOF
-
-    # pacman hook to restore file capabilities after upgrade
-    install -Dm0644 /dev/stdin "$pkgdir/usr/share/libalpm/hooks/roam-setcap.hook" <<EOF
-[Trigger]
-Type = Path
-Operation = Install
-Operation = Upgrade
-Target = usr/sbin/roam
-
-[Action]
-Description = Setting file capabilities on roam...
-When = PostTransaction
-Exec = /usr/bin/setcap cap_dac_read_search,cap_setpcap+eip /usr/sbin/roam
 EOF
 }

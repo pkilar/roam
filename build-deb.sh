@@ -4,9 +4,21 @@
 #
 # Usage: ./build-deb.sh
 #
-# Requires: debhelper, dpkg-dev, gcc, linux-libc-dev
+# Requires: cargo, rustc, debhelper, dpkg-dev, make
 #
 set -euo pipefail
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || {
+        echo "Missing required command: $1" >&2
+        exit 1
+    }
+}
+
+need_cmd cargo
+need_cmd dpkg-buildpackage
+need_cmd make
+need_cmd rustc
 
 SRCDIR=$(cd "$(dirname "$0")" && pwd)
 cd "$SRCDIR"

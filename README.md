@@ -1,48 +1,37 @@
 # roam - Read-Only Access Mode
 
-A Linux security utility that gives you a shell where you can **read any file on the system** but **cannot write to anything**. Designed for safe troubleshooting on production servers.
+`roam` is a Linux troubleshooting utility for operators who already have root access but want a safer workflow. It starts a read-only shell under a dedicated non-root user, keeps full read visibility with `CAP_DAC_READ_SEARCH`, enforces write denial with Landlock, and exposes a narrow in-session broker for approved edits, exec profiles, service actions, and an optional `sudo` passthrough path.
 
-## The Problem
+Detailed internals are documented in [ARCHITECTURE.md](ARCHITECTURE.md).
 
-Your team has root access to production servers. 95% of the work is reading logs and config files. But a single misplaced `rm -rf /var/log` or accidental paste can destroy data. Your team wants a safety net.
+## Why roam exists
 
-## The Solution
+Production troubleshooting is usually read-heavy: logs, configs, process state, and service status. The risk comes from accidental writes, not lack of privilege. `roam` reduces that risk without forcing operators to leave the shell when they need a carefully controlled edit, restart, or privileged command.
 
-`roam` drops you into a read-only shell with full visibility:
+## What the current design does
 
-```bash
-$ sudo -u roam roam
-roam: Read-Only Access Mode active (user: roam, Landlock ABI v5)
-  CAP_DAC_READ_SEARCH: can read all files
-  Writable exceptions: /dev /proc /sys /run /tmp /home/roam
-  Type 'exit' to return.
+- `sudo /usr/sbin/roam shell` starts a root launcher.
+- The launcher spawns:
+  - a read-only session as the `roam` user
+  - a per-session privileged broker for approved actions
+- The session:
+  - can read protected files with `CAP_DAC_READ_SEARCH`
+  - is locked down with Landlock and `PR_SET_NO_NEW_PRIVS`
+  - can hide sensitive paths with blacklist overmounts
+- The broker:
+  - supports `roam edit <profile>` with `sudoedit`-style temp copies, diffs, validators, and atomic installs
+  - supports `roam exec <profile> [args...]` for allowlisted command profiles
+  - supports `roam service <status|restart|reload> <profile>` for allowlisted systemd units
+  - can optionally support `roam sudo-passthrough -- <command> [args...]`; interactive `bash` and `zsh` sessions also install a local `sudo` alias for that path
 
-$ cat /etc/shadow          # works - can read any file
-$ less /var/log/messages   # works - including interactive pagers
-$ rm /var/log/messages     # blocked by Landlock
-rm: cannot remove '/var/log/messages': Permission denied
-$ exit
-```
-
-## How It Works
-
-Six layers of protection work together:
-
-| Layer | Mechanism                | Purpose                                                                                   |
-| ----- | ------------------------ | ----------------------------------------------------------------------------------------- |
-| 1     | **Landlock LSM**         | Kernel-enforced read-only filesystem. Blocks all writes except configured exceptions.     |
-| 2     | **CAP_DAC_READ_SEARCH**  | Bypasses file read permissions so the non-root user can read everything.                  |
-| 3     | **Bounding set cleared** | Only `CAP_DAC_READ_SEARCH` can ever be acquired. No other capability escalation possible. |
-| 4     | **PR_SET_NO_NEW_PRIVS**  | Blocks setuid/setgid escalation. No `su`, no `sudo`, no escape.                           |
-| 5     | **Non-root user**        | Standard POSIX isolation. Cannot signal other users' processes.                           |
-| 6     | **Sudo session logging** | Full audit trail via `log_input`/`log_output`.                                            |
+No file capabilities are installed on the shipped binary. The root launcher configures the session process directly.
 
 ## Requirements
 
-- Linux kernel 5.13+ (Landlock support) - RHEL 9+, Ubuntu 22.04+, Debian 12+
-- `gcc` and Linux kernel headers for building
-- `sudo` for invocation and audit logging
-- No external library dependencies (uses raw syscalls)
+- Linux kernel 5.19+ recommended for Landlock ABI v3+
+- `sudo`
+- Rust toolchain for local builds: `cargo`, `rustc`
+- Root access for installation and real session testing
 
 ## Quick Start
 
@@ -50,264 +39,174 @@ Six layers of protection work together:
 # Build
 make
 
-# Create the system user
+# Create the session user
 sudo make install-user
 
-# Install binary, config, and sudoers
+# Install binary, session config, policy, and sudoers
 sudo make install
 
-# Use it
-sudo -u roam roam
+# Start a read-only shell
+sudo roam shell
 ```
 
-## Installation Details
-
-`make install` does the following:
-
-1. Installs the binary to `/usr/sbin/roam` (mode 0755)
-2. Sets file capabilities: `cap_dac_read_search,cap_setpcap+eip`
-3. Installs default config to `/etc/sysconfig/roam` (won't overwrite existing)
-4. Installs sudoers drop-in to `/etc/sudoers.d/roam` (won't overwrite existing)
-
-`make install-user` creates the `roam` system user:
+Inside the session:
 
 ```bash
-useradd -r -m -s /sbin/nologin roam
-```
-
-### Verify the Setup
-
-```bash
-# Check file capabilities are set
-getcap /usr/sbin/roam
-# Expected: /usr/sbin/roam cap_dac_read_search,cap_setpcap=eip
-
-# Check the user exists
-id roam
-
-# Check sudoers syntax
-sudo visudo -c -f /etc/sudoers.d/roam
+cat /etc/ssh/sshd_config
+journalctl -u sshd --no-pager
+roam edit sshd_config
+roam exec journalctl -u sshd -n 50
+roam service restart sshd
+# Optional: works in interactive bash/zsh sessions when [sudo_passthrough] enabled = true
+sudo id
 ```
 
 ## Configuration
 
-### /etc/sysconfig/roam
+### `/etc/roam/config.toml`
 
-```bash
-# System user (must exist)
-ROAM_USER="roam"
+Session settings:
 
-# Writable path exceptions (space-separated)
-# User's home dir is ALWAYS added automatically
-ROAM_WRITABLE="/dev /proc /sys /run /tmp"
-
-# Shell override (default: /bin/bash)
-# ROAM_SHELL="/bin/bash"
+```toml
+user = "roam"
+writable = ["/dev", "/proc", "/sys", "/run", "/tmp"]
+blacklist = ["/etc/shadow", "/dev/sda"]
+blacklist_glob = ["/dev/sd[a-z]", "/etc/*.key"]
+allow_degraded = false
+shell = "/bin/bash"
 ```
 
-**Security**: This file must be owned by root and not group/world-writable. `roam` validates this at startup and refuses to run if the file is tampered with.
+- `blacklist` blocks exact paths or whole directory trees.
+- `blacklist_glob` expands absolute glob patterns to concrete paths when the session starts.
+- Blacklisted paths are hidden inside the session and are also rejected by the broker for edits.
 
-### /etc/sudoers.d/roam
+### `/etc/roam/policy.toml`
 
+Broker allowlist for edits, exec profiles, and service actions:
+
+```toml
+[edit.sshd_config]
+path = "/etc/ssh/sshd_config"
+validator = ["/usr/sbin/sshd", "-t", "-f", "{candidate}"]
+
+[service.sshd]
+unit = "sshd.service"
+actions = ["status", "restart", "reload"]
+
+[exec.journalctl]
+program = "/usr/bin/journalctl"
+args = ["--no-pager"]
+allow_extra_args = true
+
+[sudo_passthrough]
+enabled = false
 ```
-# Enable session I/O logging for audit
+
+Edit, service, and exec actions all require named profiles. `sudo_passthrough` is optional, disabled by default, and acts as a break-glass path that re-enters `sudo` under the original operator identity. In interactive `bash` and `zsh` sessions, `roam` installs `alias sudo='roam sudo-passthrough'` for convenience, but the broker still fails closed unless `[sudo_passthrough] enabled = true`. Other shells should use the explicit `roam sudo-passthrough -- ...` command. The alias is only a shortcut for `sudo <command> ...`; it does not emulate host `sudo` option parsing.
+The policy file must be owned by `root` and must not be group/world-writable; `roam` now refuses to load an unsafe policy file.
+
+### `/etc/sudoers.d/roam`
+
+```sudoers
 Defaults:%wheel log_input, log_output
-
-# Allow wheel members to use roam without a password
-%wheel ALL=(roam) NOPASSWD: /usr/sbin/roam
-```
-
-Adjust `%wheel` to match your environment (e.g., `%admins`, specific users).
-
-### Why Are /dev, /proc, /sys, /run Writable?
-
-These are virtual/pseudo filesystems. Since `roam` runs as a non-privileged user, **POSIX permissions already prevent writes** to these paths. Listing them as Landlock exceptions avoids edge cases with device files (`/dev/null`, `/dev/tty`, `/dev/pts/*`) and tools that interact with `/proc/self/*`, while adding zero security risk.
-
-## Usage
-
-### Interactive Shell
-
-```bash
-sudo -u roam roam
-```
-
-### Run a Single Command
-
-```bash
-sudo -u roam roam cat /etc/shadow
-sudo -u roam roam grep ERROR /var/log/messages
-sudo -u roam roam journalctl -u sshd --no-pager
-```
-
-### Shell Alias (Optional)
-
-Add to your `~/.bashrc`:
-
-```bash
-alias roam='sudo -u roam /usr/sbin/roam'
-```
-
-Then just:
-
-```bash
-roam                           # interactive shell
-roam less /var/log/messages    # one-off command
-```
-
-### Detecting roam Inside Scripts
-
-The `ROAM` environment variable is set to `1` inside a roam session:
-
-```bash
-if [ "$ROAM" = "1" ]; then
-    echo "Running in read-only mode"
-fi
+%wheel ALL=(root) NOPASSWD: /usr/sbin/roam shell, /usr/sbin/roam shell *
 ```
 
 ## Architecture
 
-### How roam Runs
+1. The root launcher loads `/etc/roam/config.toml` and `/etc/roam/policy.toml`.
+2. It creates a per-session broker socket and lock FD.
+3. It spawns the broker as a root-owned helper.
+4. It creates a private mount namespace, overmounts blacklisted paths, drops to the `roam` user, restores `CAP_DAC_READ_SEARCH`, applies Landlock, and `exec`s the target shell or command.
+5. In-session `roam edit`, `roam exec`, `roam service`, and `roam sudo-passthrough` commands talk to the broker over the inherited socket.
 
-```
-sudo -u roam /usr/sbin/roam
-  |
-  |-- Phase 1: Parse /etc/sysconfig/roam (validate root ownership)
-  |-- Phase 2: Capability setup
-  |     |-- Add CAP_DAC_READ_SEARCH to inheritable set
-  |     |-- Raise as ambient capability
-  |     |-- Clear bounding set (defense-in-depth)
-  |     '-- Drop CAP_SETPCAP
-  |-- Phase 3: Landlock setup
-  |     |-- Detect ABI version (v1-v5)
-  |     |-- Create read-only ruleset for /
-  |     '-- Add writable exceptions from config
-  |-- Phase 4: Lock down
-  |     |-- PR_SET_NO_NEW_PRIVS
-  |     '-- landlock_restrict_self
-  '-- Phase 5: Launch bash (login shell)
-        |
-        '-- All child processes inherit:
-              - CAP_DAC_READ_SEARCH (via ambient caps)
-              - Landlock read-only restrictions
-              - no_new_privs flag
-```
+## Build and Package
 
-### Capability Inheritance
-
-The critical challenge is passing `CAP_DAC_READ_SEARCH` through to bash and all descendant processes. This is achieved via **ambient capabilities**:
-
-1. The binary has file capabilities (`setcap cap_dac_read_search,cap_setpcap+eip`)
-2. When sudo runs it as the `roam` user, the process gets `CAP_DAC_READ_SEARCH` in its effective/permitted sets
-3. `roam` adds it to the inheritable set and raises it as ambient
-4. After launching bash, the ambient cap becomes effective/permitted in bash
-5. Every child process (`cat`, `less`, `grep`, ...) inherits it the same way
-
-**Ordering constraint**: Ambient capabilities must be raised **before** `PR_SET_NO_NEW_PRIVS` is set, because some kernel versions block `PR_CAP_AMBIENT_RAISE` afterward.
-
-### Landlock Access Masks
-
-Landlock rejects directory-only access rights (e.g., `MAKE_DIR`, `REMOVE_DIR`) on non-directory file descriptors. `roam` uses `fstat()` on each writable exception path and selects the appropriate mask:
-
-- **Directories**: Full read+write+create+delete access
-- **Files**: Read+write+truncate only (file-compatible rights)
-
-### What Cannot Be Done in a roam Session
-
-- Write, create, rename, or delete files on persistent filesystems
-- Escalate privileges (`su`, `sudo`, setuid binaries)
-- Gain new capabilities beyond `CAP_DAC_READ_SEARCH`
-- Signal processes owned by other users
-- Load kernel modules, mount filesystems, or modify system state
-
-### What CAN Be Done
-
-- Read any file on any filesystem (local, NFS, Lustre, etc.)
-- Use interactive tools: `less`, `vim` (read-only), `top`, `htop`, `journalctl`
-- Run diagnostic commands: `ps`, `netstat`, `ss`, `ip`, `df`, `free`
-- Write to `/tmp` (for tools that need temp files)
-- Write to the roam user's home directory (shell history, etc.)
-
-## Packaging Notes
-
-### RPM
-
-File capabilities are lost when a binary is replaced. In your `.spec` file:
-
-```spec
-%post
-setcap cap_dac_read_search,cap_setpcap+eip /usr/sbin/roam
-
-%caps(cap_dac_read_search,cap_setpcap=eip) /usr/sbin/roam
-```
-
-### SELinux
-
-On RHEL with SELinux enforcing, verify the binary's SELinux context allows file capabilities. If needed:
+Local development:
 
 ```bash
-semanage fcontext -a -t bin_t /usr/sbin/roam
-restorecon -v /usr/sbin/roam
+make
+make check
+make test
+make fmt
+make clippy
 ```
+
+Packaging helpers:
+
+```bash
+make rpm
+make deb
+make arch
+```
+
+Package manifests live in:
+
+- `roam.spec`
+- `debian/`
+- `archpkg/PKGBUILD`
+
+## Verification
+
+Verified in this repository:
+
+- `make`
+- `make check`
+- `make test`
+- `make clippy`
+- `make install DESTDIR=/tmp/...`
+- `make arch`
+- `HOME=/tmp ./build-rpm.sh`
+- `cargo check --workspace`
+- `cargo test --workspace`
+
+Recommended root smoke tests after installation:
+
+```bash
+sudo roam shell /usr/bin/true
+sudo roam shell cat /etc/hostname
+sudo roam shell sh -lc 'touch /etc/should-fail'   # should fail
+sudo roam shell cat /etc/shadow                    # should fail if blacklisted
+```
+
+## Upgrade Notes
+
+The Rust rewrite is versioned as `2.0.0` so package-manager upgrades from the older `1.0.0` C release line work normally. Upgrade the package in place with your usual RPM, Arch, or Debian tooling; no epoch override or downgrade flag should be needed.
 
 ## Troubleshooting
 
-### "CAP_DAC_READ_SEARCH not available"
+### `permission denied: use sudo to start a roam session`
 
-File capabilities aren't set on the binary:
-```bash
-sudo setcap cap_dac_read_search,cap_setpcap+eip /usr/sbin/roam
-```
-
-### "must run as 'roam'"
-
-You need to use sudo to switch users:
-```bash
-sudo -u roam /usr/sbin/roam
-```
-
-### "Landlock not supported by this kernel"
-
-Your kernel is older than 5.13. Check with `uname -r`. Landlock may also be disabled via boot parameter or kernel config.
-
-### "This account is currently not available" from less/vim
-
-The `SHELL` environment variable is set to `/sbin/nologin`. This should be handled automatically by `roam`, but if you see it, set `ROAM_SHELL=/bin/bash` in `/etc/sysconfig/roam`.
-
-### Permission denied writing to /dev/null
-
-Ensure `/dev` is in the `ROAM_WRITABLE` list in `/etc/sysconfig/roam`.
-
-### Config file validation failure
-
-The config file must be owned by root (uid 0) and not group or world-writable:
-```bash
-sudo chown root:root /etc/sysconfig/roam
-sudo chmod 644 /etc/sysconfig/roam
-```
-
-## Security Hardening
-
-### Minimum Kernel Version
-
-`roam` requires **Landlock ABI v3** (kernel 5.19+) for complete read-only enforcement. ABI v1/v2 cannot mediate `rename` and `truncate` operations, meaning files could be renamed or truncated despite the "read-only" sandbox. On ABI < 3, `roam` refuses to start by default. Set `ROAM_ALLOW_DEGRADED=1` in `/etc/sysconfig/roam` to override (not recommended for production).
-
-### Disable Unprivileged User Namespaces
-
-Unprivileged user namespaces allow creating new mount namespaces, which can potentially circumvent Landlock restrictions by bind-mounting over writable exception paths. On production servers, consider disabling them:
+Start the session with:
 
 ```bash
-# Debian/Ubuntu
-sudo sysctl -w kernel.unprivileged_userns_clone=0
-
-# RHEL/General (kernel 6.1+)
-sudo sysctl -w user.max_user_namespaces=0
+sudo roam shell
 ```
 
-**Note**: This affects containerized workloads (Podman rootless, Flatpak, etc.). Evaluate impact before applying.
+### `Landlock not supported by this kernel`
 
-### Inherited File Descriptors
+Use a kernel with Landlock support. Full read-only enforcement requires ABI v3+.
+If you intentionally need degraded mode, set `allow_degraded = true` in `/etc/roam/config.toml`.
 
-`roam` closes all inherited file descriptors (except stdin/stdout/stderr) before enforcing Landlock. This prevents bypass via `sudo --preserve-fds` or other FD-passing mechanisms.
+### Blacklist glob matched no paths
+
+Blacklist globs are expanded when the session starts. Check the pattern against the current filesystem contents.
+
+### `build-deb.sh` reports `Missing required command: dpkg-buildpackage`
+
+Install Debian packaging tools such as `dpkg-dev` and `debhelper`, then rerun `make deb`.
+
+### Validator failed during `roam edit`
+
+The candidate file was edited, diffed, and then rejected by the profile validator. Fix the file and retry, or update the policy profile if the validator is wrong.
+
+### Commands time out unexpectedly
+
+Broker-run validators, exec profiles, service actions, and sudo passthrough commands now have a 30 second execution timeout. If a command legitimately needs longer, it must be redesigned or the timeout logic must be adjusted in code.
+
+### `sudo passthrough is disabled in policy.toml`
+
+Set `[sudo_passthrough] enabled = true` in `/etc/roam/policy.toml` if you want the break-glass path available inside the session.
 
 ## License
 

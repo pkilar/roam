@@ -1,5 +1,5 @@
-roam (1.0.0-1) unstable; urgency=low
+roam (2.0.0-1) unstable; urgency=low
 
-  * Initial release.
+  * Rewrite roam and the privileged sidecar in Rust.
 
- -- Paul Kilar <pkilar@gmail.com>  Sun, 16 Mar 2025 12:00:00 +0000
+ -- Paul Kilar <pkilar@gmail.com>  Sat, 28 Mar 2026 00:00:00 +0000

@@ -2,20 +2,24 @@ Source: roam
 Section: admin
 Priority: optional
 Maintainer: Paul Kilar <pkilar@gmail.com>
-Build-Depends: debhelper-compat (= 13), gcc, linux-libc-dev
+Build-Depends: debhelper-compat (= 13), cargo, rustc, make
 Standards-Version: 4.6.2
 Homepage: https://github.com/pkilar/roam
 Rules-Requires-Root: no
 
 Package: roam
 Architecture: any
-Depends: ${shlibc:Depends}, ${misc:Depends}, sudo, libcap2-bin
+Depends: ${shlibs:Depends}, ${misc:Depends}, sudo
 Pre-Depends: adduser
 Description: Read-Only Access Mode - safe troubleshooting shell
- roam is a Linux security utility that creates a sandboxed shell with
- read-only filesystem access. It runs as a dedicated non-root user via
- sudo, uses CAP_DAC_READ_SEARCH to read all files, Landlock LSM for
- write protection, and sudo session logging for audit.
+ roam is a Linux security utility that starts a read-only troubleshooting
+ shell under the dedicated roam user while a root-owned sidecar broker
+ handles approved file edits, exec profiles, service actions, and
+ optional sudo passthrough.
+ .
+ The session uses CAP_DAC_READ_SEARCH to read protected files, Landlock
+ LSM for write protection, blacklist overmounts for sensitive paths, and
+ sudo session logging for audit.
  .
  Designed for safe troubleshooting on production servers where teams need
  to view logs and config files without risk of accidental modification.

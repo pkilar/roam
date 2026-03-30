@@ -1,6 +1,6 @@
 # Build artifacts
 roam
-*.o
+target/
 
 # RPM build
 *.rpm
@@ -22,3 +22,4 @@ roam
 .fastembed_cache/
 .claude/
 notes
+roam.code-workspace
