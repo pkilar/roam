@@ -25,6 +25,7 @@ const SYSTEMCTL_PATH: &str = "/usr/bin/systemctl";
 const SUDO_PATH: &str = "/usr/bin/sudo";
 const BACKUP_ROOT: &str = "/var/lib/roam/backups";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CONCURRENT_EDITS: usize = 16;
 
 pub fn serve_fd(fd: RawFd, policy_path: &Path, metadata: SessionMetadata) -> Result<()> {
     let session_config = SessionConfig::load(DEFAULT_CONFIG_PATH)?;
@@ -46,6 +47,7 @@ struct Broker {
     blacklist: Vec<BlockedPath>,
     metadata: SessionMetadata,
     work_dir: PathBuf,
+    edit_dir: PathBuf,
     edits: HashMap<String, EditTransaction>,
 }
 
@@ -53,6 +55,7 @@ struct EditTransaction {
     profile_name: String,
     profile: EditProfile,
     candidate_path: PathBuf,
+    original_content: Vec<u8>,
 }
 
 impl Broker {
@@ -62,11 +65,24 @@ impl Broker {
         blacklist: Vec<BlockedPath>,
         metadata: SessionMetadata,
     ) -> Result<Self> {
+        // Broker internal work dir — root-owned, inaccessible to session user.
+        // Protects temp stdout/stderr from privileged commands against cross-session reads.
         let mut work_dir = std::env::temp_dir();
-        work_dir.push(format!("roam-session-{}", metadata.session_id));
+        work_dir.push(format!("roam-broker-{}", metadata.session_id));
         fs::create_dir_all(&work_dir)?;
         fs::set_permissions(&work_dir, fs::Permissions::from_mode(0o700))?;
-        chown_path(&work_dir, metadata.session_uid, metadata.session_gid)?;
+
+        // Edit candidate dir — session-user-owned 0o700 with opaque name.
+        // Uses a separate random UUID (not the session_id) so the dir name
+        // cannot be guessed even if the session_id leaks via syslog.
+        // No recognizable prefix prevents glob enumeration by concurrent sessions.
+        // Editors need a writable parent for swap files and rename-on-save.
+        let edit_uuid = uuid::Uuid::new_v4();
+        let mut edit_dir = std::env::temp_dir();
+        edit_dir.push(format!(".{edit_uuid}"));
+        fs::create_dir_all(&edit_dir)?;
+        fs::set_permissions(&edit_dir, fs::Permissions::from_mode(0o700))?;
+        chown_path(&edit_dir, metadata.session_uid, metadata.session_gid)?;
 
         let mut backup_root = PathBuf::from(BACKUP_ROOT);
         backup_root.push(metadata.session_id.to_string());
@@ -87,6 +103,7 @@ impl Broker {
             blacklist,
             metadata,
             work_dir,
+            edit_dir,
             edits: HashMap::new(),
         })
     }
@@ -109,6 +126,7 @@ impl Broker {
         }
 
         let _ = fs::remove_dir_all(&self.work_dir);
+        let _ = fs::remove_dir_all(&self.edit_dir);
         let _ = fs::remove_dir_all(self.metadata.runtime_root());
         syslog_info(&format!(
             "broker exited: session_id={}",
@@ -133,6 +151,12 @@ impl Broker {
     }
 
     fn begin_edit(&mut self, profile_name: &str) -> Result<BrokerResponse> {
+        if self.edits.len() >= MAX_CONCURRENT_EDITS {
+            return Err(Error::Rejected(format!(
+                "too many concurrent edits (limit {})",
+                MAX_CONCURRENT_EDITS
+            )));
+        }
         let profile = self
             .policy
             .edit
@@ -148,14 +172,17 @@ impl Broker {
 
         let ticket = uuid::Uuid::new_v4().to_string();
         let candidate_path = self
-            .work_dir
+            .edit_dir
             .join(format!("{profile_name}.{ticket}.candidate"));
 
-        if profile.path.exists() {
-            fs::copy(&profile.path, &candidate_path)?;
+        let original_content = if profile.path.exists() {
+            let content = fs::read(&profile.path)?;
+            fs::write(&candidate_path, &content)?;
+            content
         } else {
             File::create(&candidate_path)?;
-        }
+            Vec::new()
+        };
         fs::set_permissions(&candidate_path, fs::Permissions::from_mode(0o600))?;
         chown_path(
             &candidate_path,
@@ -171,6 +198,7 @@ impl Broker {
                 profile_name: profile_name.to_string(),
                 profile,
                 candidate_path: candidate_path.clone(),
+                original_content,
             },
         );
 
@@ -223,6 +251,28 @@ impl Broker {
             .remove(ticket)
             .ok_or_else(|| Error::Rejected(format!("unknown edit ticket '{ticket}'")))?;
 
+        // Fail closed if the target was modified after the edit started.
+        // On conflict, re-insert the transaction so the user can abort or
+        // inspect their draft — the candidate file is intentionally preserved.
+        let current_target = match fs::read(&txn.profile.path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => {
+                self.edits.insert(ticket.to_string(), txn);
+                return Err(err.into());
+            }
+        };
+        if current_target != txn.original_content {
+            let candidate_path = txn.candidate_path.clone();
+            self.edits.insert(ticket.to_string(), txn);
+            return Ok(BrokerResponse::EditConflict {
+                ticket: ticket.to_string(),
+                candidate_path,
+                message: "target file was modified after edit started; your draft is preserved"
+                    .to_string(),
+            });
+        }
+
         let changed = file_changed(&txn.profile.path, &txn.candidate_path)?;
         if !changed {
             let _ = fs::remove_file(&txn.candidate_path);
@@ -238,18 +288,35 @@ impl Broker {
             }
         }
 
-        let backup_path = install_candidate(&txn, &self.metadata)?;
-        let _ = fs::remove_file(&txn.candidate_path);
-
-        syslog_info(&format!(
-            "edit committed: session_id={} profile={} target={} backup={}",
-            self.metadata.session_id,
-            txn.profile_name,
-            txn.profile.path.display(),
-            backup_path.display()
-        ));
-
-        Ok(BrokerResponse::EditCommitted { backup_path })
+        match install_candidate(&txn, &self.metadata) {
+            Ok(backup_path) => {
+                let _ = fs::remove_file(&txn.candidate_path);
+                syslog_info(&format!(
+                    "edit committed: session_id={} profile={} target={} backup={}",
+                    self.metadata.session_id,
+                    txn.profile_name,
+                    txn.profile.path.display(),
+                    backup_path.display()
+                ));
+                Ok(BrokerResponse::EditCommitted { backup_path })
+            }
+            Err(Error::Conflict(msg)) => {
+                // Late conflict during install — re-insert for recovery,
+                // same handling as the early conflict path.
+                let candidate_path = txn.candidate_path.clone();
+                self.edits.insert(ticket.to_string(), txn);
+                Ok(BrokerResponse::EditConflict {
+                    ticket: ticket.to_string(),
+                    candidate_path,
+                    message: msg,
+                })
+            }
+            Err(err) => {
+                // Other install error — re-insert so abort can clean up.
+                self.edits.insert(ticket.to_string(), txn);
+                Err(err)
+            }
+        }
     }
 
     fn abort_edit(&mut self, ticket: &str) -> Result<BrokerResponse> {
@@ -394,6 +461,24 @@ fn install_candidate(txn: &EditTransaction, metadata: &SessionMetadata) -> Resul
     fs::set_permissions(&temp_path, fs::Permissions::from_mode(mode))?;
     fsync_file(&temp_path)?;
 
+    // Final recheck immediately before rename to close the TOCTOU window
+    // between the early check in commit_edit and the actual install
+    // (a slow validator could widen this gap to seconds).
+    let current_target = match fs::read(&txn.profile.path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => {
+            let _ = fs::remove_file(&temp_path);
+            return Err(err.into());
+        }
+    };
+    if current_target != txn.original_content {
+        let _ = fs::remove_file(&temp_path);
+        return Err(Error::Conflict(
+            "target file was modified during commit; aborting to prevent data loss".to_string(),
+        ));
+    }
+
     if txn.profile.path.exists() {
         fs::copy(&txn.profile.path, &backup_path)?;
     } else {
@@ -531,17 +616,30 @@ fn run_command(
             .collect();
         let uid = identity.uid;
         let gid = identity.gid;
-        // SAFETY: pre_exec only performs direct libc identity-changing syscalls with owned captured data.
+        // SAFETY: pre_exec performs direct libc syscalls with owned captured data.
+        // setpgid creates a new process group so the broker can kill the entire tree on timeout.
         unsafe {
             command.pre_exec(move || {
-                let rc = libc::setgroups(groups.len(), groups.as_ptr());
-                if rc == -1 {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setgroups(groups.len(), groups.as_ptr()) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
                 if libc::setresgid(gid, gid, gid) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
                 if libc::setresuid(uid, uid, uid) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    } else {
+        // SAFETY: setpgid is a direct libc syscall with no pointer arguments.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
@@ -617,7 +715,14 @@ fn wait_for_child(
         }
         if start.elapsed() >= timeout {
             *timed_out = true;
-            let _ = child.kill();
+            let pid = child.id() as libc::pid_t;
+            // SAFETY: kill with a negative pid targets the process group;
+            // positive pid targets the direct child as a fallback in case
+            // the child moved itself to a different process group.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+                libc::kill(pid, libc::SIGKILL);
+            }
             return Ok(child.wait()?);
         }
         thread::sleep(poll_interval);
@@ -734,7 +839,9 @@ mod tests {
             let root =
                 std::env::temp_dir().join(format!("roam-broker-test-{}", uuid::Uuid::new_v4()));
             let work_dir = root.join("work");
+            let edit_dir = root.join("edits");
             fs::create_dir_all(&work_dir).expect("create work dir");
+            fs::create_dir_all(&edit_dir).expect("create edit dir");
             let (stream, peer) = UnixStream::pair().expect("socket pair");
             let uid = current_uid();
             let gid = current_gid();
@@ -758,6 +865,7 @@ mod tests {
                     session_gid: gid,
                 },
                 work_dir,
+                edit_dir,
                 edits: HashMap::new(),
             };
             Self {
@@ -901,5 +1009,65 @@ mod tests {
 
         assert!(err.to_string().contains("candidate has no changes"));
         assert!(!started.candidate_path.exists());
+    }
+
+    #[test]
+    fn commit_edit_returns_conflict_and_preserves_candidate() {
+        let mut harness = BrokerHarness::new();
+        let target_path = harness.root.join("sshd_config");
+        fs::write(&target_path, "Port 22\n").expect("write target");
+        harness.add_edit_profile("sshd", target_path.clone());
+
+        let response = harness
+            .broker
+            .handle_request(BrokerRequest::BeginEdit {
+                profile: "sshd".to_string(),
+            })
+            .expect("begin edit should succeed");
+        let BrokerResponse::EditStarted(started) = response else {
+            panic!("unexpected response")
+        };
+
+        // Simulate the session user editing the candidate
+        fs::write(&started.candidate_path, "Port 2222\n").expect("update candidate");
+
+        // Simulate a concurrent admin modifying the target after the edit started
+        fs::write(&target_path, "Port 443\n").expect("concurrent modification");
+
+        let response = harness
+            .broker
+            .handle_request(BrokerRequest::CommitEdit {
+                ticket: started.ticket.clone(),
+            })
+            .expect("request should succeed");
+
+        let BrokerResponse::EditConflict {
+            ticket,
+            candidate_path,
+            message,
+        } = response
+        else {
+            panic!("expected EditConflict, got {response:?}")
+        };
+
+        assert!(message.contains("modified after edit started"));
+        // User's draft must be preserved, not deleted
+        assert!(candidate_path.exists());
+        assert_eq!(
+            fs::read_to_string(&candidate_path).expect("read candidate"),
+            "Port 2222\n"
+        );
+        // Concurrent admin change must not be overwritten
+        assert_eq!(
+            fs::read_to_string(&target_path).expect("read target"),
+            "Port 443\n"
+        );
+        // Transaction is re-inserted so abort can clean up
+        let response = harness
+            .broker
+            .handle_request(BrokerRequest::AbortEdit { ticket })
+            .expect("abort should succeed");
+        assert!(matches!(response, BrokerResponse::EditAborted));
+        assert!(!candidate_path.exists());
     }
 }
