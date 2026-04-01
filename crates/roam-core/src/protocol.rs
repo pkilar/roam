@@ -43,6 +43,11 @@ pub enum BrokerResponse {
     EditStarted(EditStarted),
     EditInspection(EditInspection),
     EditCommitted { backup_path: PathBuf },
+    EditConflict {
+        ticket: String,
+        candidate_path: PathBuf,
+        message: String,
+    },
     EditAborted,
     ExecResult(CommandOutcome),
     ServiceResult(ServiceOutcome),

@@ -27,6 +27,9 @@ pub enum Error {
 
     #[error("request rejected: {0}")]
     Rejected(String),
+
+    #[error("edit conflict: {0}")]
+    Conflict(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

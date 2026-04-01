@@ -202,11 +202,20 @@ fn run_edit(profile: &str) -> Result<()> {
     }
 
     match session.round_trip(BrokerRequest::CommitEdit {
-        ticket: started.ticket,
+        ticket: started.ticket.clone(),
     })? {
         BrokerResponse::EditCommitted { backup_path } => {
             println!("Installed. Backup saved to {}", backup_path.display());
             Ok(())
+        }
+        BrokerResponse::EditConflict {
+            candidate_path,
+            message,
+            ..
+        } => {
+            eprintln!("Conflict: {message}");
+            eprintln!("Your draft is preserved at: {}", candidate_path.display());
+            Err(Error::Rejected("edit aborted due to conflict".to_string()))
         }
         BrokerResponse::Error { message } => Err(Error::Rejected(message)),
         other => Err(Error::Protocol(format!("unexpected response: {other:?}"))),
