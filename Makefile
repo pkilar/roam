@@ -14,10 +14,10 @@ debug: $(DEBUG_BIN)
 release: $(TARGET)
 
 $(DEBUG_BIN):
-	$(CARGO) build --workspace --bins
+	ROAM_SHELL_DIR=$(SHELLDIR) $(CARGO) build --workspace --bins
 
 $(RELEASE_BIN):
-	$(CARGO) build --workspace --release --bins
+	ROAM_SHELL_DIR=$(SHELLDIR) $(CARGO) build --workspace --release --bins
 
 $(TARGET): $(RELEASE_BIN)
 	install -m0755 $(RELEASE_BIN) $(TARGET)
@@ -43,6 +43,8 @@ deb:
 arch:
 	./build-arch.sh
 
+SHELLDIR  ?= $(PREFIX)/share/roam
+
 install: $(TARGET)
 	install -Dm0755 $(TARGET) $(DESTDIR)$(PREFIX)/sbin/$(TARGET)
 	@# Session config — don't overwrite existing
@@ -54,6 +56,13 @@ install: $(TARGET)
 	@# Sudoers — don't overwrite existing
 	test -f $(DESTDIR)/etc/sudoers.d/roam || \
 		install -Dm0440 roam.sudoers $(DESTDIR)/etc/sudoers.d/roam
+	@# Shell init files
+	install -Dm0644 shell/bashrc $(DESTDIR)$(SHELLDIR)/.bashrc
+	install -Dm0644 shell/zshenv $(DESTDIR)$(SHELLDIR)/.zshenv
+	install -Dm0644 shell/zprofile $(DESTDIR)$(SHELLDIR)/.zprofile
+	install -Dm0644 shell/zshrc $(DESTDIR)$(SHELLDIR)/.zshrc
+	install -Dm0644 shell/zlogin $(DESTDIR)$(SHELLDIR)/.zlogin
+	install -Dm0644 shell/zlogout $(DESTDIR)$(SHELLDIR)/.zlogout
 
 install-user:
 	@echo "Creating 'roam' system user..."

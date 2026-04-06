@@ -1,0 +1,8 @@
+# roam shell init for zsh.
+if [ -f "$ROAM_REAL_HOME/.zshrc" ]; then
+  . "$ROAM_REAL_HOME/.zshrc"
+fi
+alias sudo='roam sudo-passthrough'
+alias edit='roam edit'
+alias journalctl='roam exec journalctl'
+alias service='roam service'

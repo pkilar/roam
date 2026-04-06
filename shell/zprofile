@@ -1,0 +1,4 @@
+# roam shell init for zsh.
+if [ -f "$ROAM_REAL_HOME/.zprofile" ]; then
+  . "$ROAM_REAL_HOME/.zprofile"
+fi

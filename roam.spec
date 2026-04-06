@@ -13,6 +13,8 @@ BuildRequires:  rust
 Requires:       sudo
 Requires(pre):  shadow-utils
 
+%define debug_package %{nil}
+
 %description
 roam (Read-Only Access Mode) is a Linux security utility that creates a
 sandboxed troubleshooting shell with a root launcher, a read-only
@@ -37,6 +39,12 @@ install -Dm0755 target/release/roam %{buildroot}%{_sbindir}/roam
 install -Dm0644 roam.config.toml %{buildroot}%{_sysconfdir}/roam/config.toml
 install -Dm0644 roam.policy.toml %{buildroot}%{_sysconfdir}/roam/policy.toml
 install -Dm0440 roam.sudoers %{buildroot}%{_sysconfdir}/sudoers.d/roam
+install -Dm0644 shell/bashrc %{buildroot}%{_datadir}/roam/.bashrc
+install -Dm0644 shell/zshenv %{buildroot}%{_datadir}/roam/.zshenv
+install -Dm0644 shell/zprofile %{buildroot}%{_datadir}/roam/.zprofile
+install -Dm0644 shell/zshrc %{buildroot}%{_datadir}/roam/.zshrc
+install -Dm0644 shell/zlogin %{buildroot}%{_datadir}/roam/.zlogin
+install -Dm0644 shell/zlogout %{buildroot}%{_datadir}/roam/.zlogout
 
 %pre
 getent passwd roam >/dev/null 2>&1 || \
@@ -49,6 +57,12 @@ getent passwd roam >/dev/null 2>&1 || \
 %config(noreplace) %attr(0644,root,root) %{_sysconfdir}/roam/config.toml
 %config(noreplace) %attr(0644,root,root) %{_sysconfdir}/roam/policy.toml
 %config(noreplace) %attr(0440,root,root) %{_sysconfdir}/sudoers.d/roam
+%{_datadir}/roam/.bashrc
+%{_datadir}/roam/.zshenv
+%{_datadir}/roam/.zprofile
+%{_datadir}/roam/.zshrc
+%{_datadir}/roam/.zlogin
+%{_datadir}/roam/.zlogout
 
 %changelog
 * Sat Mar 28 2026 Paul Kilar <pkilar@gmail.com> - 2.0.0-1

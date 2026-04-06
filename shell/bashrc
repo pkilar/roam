@@ -1,0 +1,14 @@
+# roam shell init for bash.
+for profile in "$ROAM_REAL_HOME/.bash_profile" "$ROAM_REAL_HOME/.bash_login" "$ROAM_REAL_HOME/.profile"; do
+  if [ -f "$profile" ]; then
+    . "$profile"
+    break
+  fi
+done
+if [ -f "$ROAM_REAL_HOME/.bashrc" ]; then
+  . "$ROAM_REAL_HOME/.bashrc"
+fi
+alias sudo='roam sudo-passthrough'
+alias edit='roam edit'
+alias journalctl='roam exec journalctl'
+alias service='roam service'

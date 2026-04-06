@@ -8,6 +8,10 @@ use serde::Deserialize;
 use crate::{Error, Result};
 
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/roam/config.toml";
+pub const DEFAULT_SHELL_DIR: &str = match option_env!("ROAM_SHELL_DIR") {
+    Some(dir) => dir,
+    None => "/usr/share/roam",
+};
 pub const DEFAULT_USER: &str = "roam";
 pub const DEFAULT_WRITABLE: &str = "/dev /proc /sys /run /tmp";
 
