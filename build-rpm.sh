@@ -38,7 +38,7 @@ tar czf "${RPMBUILD}/SOURCES/${TARBALL}" \
     Cargo.toml Cargo.lock Makefile README.md ARCHITECTURE.md LICENSE \
     roam.config.toml roam.policy.toml roam.sudoers \
     build-rpm.sh build-deb.sh build-arch.sh \
-    archpkg debian crates
+    archpkg debian crates shell
 
 # Copy spec file.
 cp "${SRCDIR}/roam.spec" "${RPMBUILD}/SPECS/"
