@@ -37,7 +37,7 @@ tar czf "${BUILDDIR}/${NAME}-${VERSION}.tar.gz" \
     Cargo.toml Cargo.lock Makefile README.md ARCHITECTURE.md LICENSE \
     roam.config.toml roam.policy.toml roam.sudoers \
     build-rpm.sh build-deb.sh build-arch.sh \
-    archpkg debian crates
+    archpkg debian crates shell
 
 # Update checksums and build.
 cd "${BUILDDIR}"
