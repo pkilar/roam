@@ -1,0 +1,11 @@
+# roam shell init for zsh.
+# Save ZDOTDIR so we can restore it after sourcing the user's .zshenv.
+_roam_zdotdir="$ZDOTDIR"
+if [ -f "$ROAM_REAL_HOME/.zshenv" ]; then
+  . "$ROAM_REAL_HOME/.zshenv"
+fi
+# Keep ZDOTDIR pointing at the roam wrapper directory so subsequent
+# startup files and nested shells continue using the roam wrappers.
+ZDOTDIR="$_roam_zdotdir"
+export ZDOTDIR
+unset _roam_zdotdir

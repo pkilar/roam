@@ -2,7 +2,6 @@ use std::env;
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::RawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -11,7 +10,7 @@ use std::process::Command;
 use roam_core::config::{canonicalize_path, is_safe_home_path};
 use roam_core::{
     syslog_info, BlockedPath, BlockedPathKind, Error, Result, SessionConfig, SessionMetadata,
-    SessionUser,
+    SessionUser, DEFAULT_SHELL_DIR,
 };
 
 const CAP_DAC_READ_SEARCH: u32 = 2;
@@ -120,11 +119,14 @@ pub fn run_session(
     }
     env::set_var("SHELL", &shell);
     env::set_var("ROAM", "1");
+    // Move broker fds above the range that interactive shells use
+    // internally (bash uses low fds for job control, redirections,
+    // here-documents, and shell_tty).
+    let broker_fd = dup_above(broker_fd, 100)?;
+    let broker_lock_fd = dup_above(broker_lock_fd, 100)?;
+
     env::set_var("ROAM_BROKER_FD", broker_fd.to_string());
     env::set_var("ROAM_BROKER_LOCK_FD", broker_lock_fd.to_string());
-
-    clear_cloexec(broker_fd)?;
-    clear_cloexec(broker_lock_fd)?;
 
     eprintln!(
         "roam: Read-Only Access Mode active (user: {}, Landlock ABI v{})",
@@ -177,16 +179,35 @@ fn apply_blacklist(blacklist: &[BlockedPath]) -> Result<()> {
         None,
         (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong,
         None,
-    )?;
+    )
+    .map_err(|e| Error::message(format!("blacklist: failed to make root mount private: {e}")))?;
 
-    let placeholder_fd = create_blacklist_placeholder_fd()?;
-    let placeholder_source = format!("/proc/self/fd/{placeholder_fd}");
-
+    // Overmount blacklisted files with /dev/null so reads return EOF,
+    // then remount read-only so writes are denied rather than silently
+    // discarded into /dev/null.
     for blocked in blacklist
         .iter()
         .filter(|blocked| blocked.kind == BlockedPathKind::FileLike)
     {
-        bind_mount_path(&placeholder_source, &blocked.path)?;
+        bind_mount_path("/dev/null", &blocked.path).map_err(|e| {
+            Error::message(format!(
+                "blacklist: failed to overmount file '{}': {e}",
+                blocked.path.display()
+            ))
+        })?;
+        mount_path(
+            None,
+            &blocked.path,
+            None,
+            (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY) as libc::c_ulong,
+            None,
+        )
+        .map_err(|e| {
+            Error::message(format!(
+                "blacklist: failed to make file '{}' read-only: {e}",
+                blocked.path.display()
+            ))
+        })?;
     }
 
     for blocked in blacklist
@@ -199,10 +220,15 @@ fn apply_blacklist(blacklist: &[BlockedPath]) -> Result<()> {
             Some("tmpfs"),
             (libc::MS_NODEV | libc::MS_NOEXEC | libc::MS_NOSUID) as libc::c_ulong,
             Some("size=4k,mode=0555"),
-        )?;
+        )
+        .map_err(|e| {
+            Error::message(format!(
+                "blacklist: failed to overmount directory '{}': {e}",
+                blocked.path.display()
+            ))
+        })?;
     }
 
-    close_fd(placeholder_fd);
     Ok(())
 }
 
@@ -226,21 +252,6 @@ fn drop_privileges(user: &SessionUser) -> Result<()> {
     Ok(())
 }
 
-fn create_blacklist_placeholder_fd() -> Result<RawFd> {
-    let name = CString::new("roam-blacklisted-file").expect("static name");
-    // SAFETY: name is a valid NUL-terminated identifier.
-    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-    if fd == -1 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    // SAFETY: scalar arguments only.
-    if unsafe { libc::fchmod(fd, 0o444) } == -1 {
-        let err = std::io::Error::last_os_error();
-        close_fd(fd);
-        return Err(err.into());
-    }
-    Ok(fd)
-}
 
 fn configure_capabilities() -> Result<()> {
     let dac_bit = 1u32 << (CAP_DAC_READ_SEARCH % 32);
@@ -549,7 +560,11 @@ fn sanitize_fds(exceptions: &[RawFd]) -> Result<()> {
     Ok(())
 }
 
-fn exec_shell(shell: &Path, command: &[String], metadata: &SessionMetadata) -> Result<()> {
+fn exec_shell(
+    shell: &Path,
+    command: &[String],
+    metadata: &SessionMetadata,
+) -> Result<()> {
     if !command.is_empty() {
         let mut cmd = Command::new(&command[0]);
         cmd.args(&command[1..]);
@@ -562,103 +577,62 @@ fn exec_shell(shell: &Path, command: &[String], metadata: &SessionMetadata) -> R
         .and_then(|value| value.to_str())
         .ok_or_else(|| Error::Rejected("shell path must have a file name".to_string()))?;
 
+    let shell_dir = Path::new(DEFAULT_SHELL_DIR);
+    if !shell_dir.is_dir() {
+        eprintln!(
+            "roam: warning: shell init directory '{}' not found; aliases will not be available",
+            shell_dir.display()
+        );
+    }
+
     let login_name = format!("-{shell_name}");
     let err = match shell_name {
-        "bash" => exec_bash_shell(shell, &login_name, metadata),
-        "zsh" => exec_zsh_shell(shell, &login_name, metadata),
+        // bash ignores --rcfile for login shells, so start as a plain
+        // interactive shell; our .bashrc already sources the user's
+        // profiles and .bashrc from $ROAM_REAL_HOME.
+        "bash" => exec_bash_login(shell, shell_name, &shell_dir.join(".bashrc")),
+        "zsh" => exec_zsh_login(shell, &login_name, shell_dir, metadata),
         _ => Command::new(shell).arg0(login_name).exec(),
     };
     Err(err.into())
 }
 
-fn exec_bash_shell(shell: &Path, login_name: &str, metadata: &SessionMetadata) -> std::io::Error {
-    let runtime_root = metadata.runtime_root();
-    if let Err(err) = fs::create_dir_all(&runtime_root) {
-        return err;
-    }
-    if let Err(err) = fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o700)) {
-        return err;
-    }
-
-    let init_path = runtime_root.join("bashrc");
-    if let Err(err) = write_shell_init(&init_path, bash_sudo_alias_init()) {
-        return err;
-    }
-
+fn exec_bash_login(shell: &Path, arg0: &str, rcfile: &Path) -> std::io::Error {
     Command::new(shell)
         .arg("--noprofile")
         .arg("--rcfile")
-        .arg(&init_path)
+        .arg(rcfile)
         .arg("-i")
-        .arg0(login_name)
+        .arg0(arg0)
         .exec()
 }
 
-fn exec_zsh_shell(shell: &Path, login_name: &str, metadata: &SessionMetadata) -> std::io::Error {
+/// Create a per-session writable ZDOTDIR with symlinks to the installed
+/// wrapper files so zsh finds the roam wrappers during startup while
+/// plugins, completion dumps, and history can write to the session dir.
+fn exec_zsh_login(
+    shell: &Path,
+    login_name: &str,
+    shell_dir: &Path,
+    metadata: &SessionMetadata,
+) -> std::io::Error {
     let zdotdir = metadata.runtime_root().join("zsh");
     if let Err(err) = fs::create_dir_all(&zdotdir) {
         return err;
     }
-    if let Err(err) = fs::set_permissions(&zdotdir, fs::Permissions::from_mode(0o700)) {
-        return err;
-    }
-
-    for (name, contents) in zsh_sudo_alias_init_files() {
-        let path = zdotdir.join(name);
-        if let Err(err) = write_shell_init(&path, &contents) {
-            return err;
+    for name in [".zshenv", ".zprofile", ".zshrc", ".zlogin", ".zlogout"] {
+        let src = shell_dir.join(name);
+        if src.exists() {
+            let dst = zdotdir.join(name);
+            if let Err(err) = std::os::unix::fs::symlink(&src, &dst) {
+                return err;
+            }
         }
     }
-
-    env::set_var("ZDOTDIR", &zdotdir);
-    Command::new(shell).arg0(login_name).exec()
-}
-
-fn write_shell_init(path: &Path, contents: &str) -> std::io::Result<()> {
-    fs::write(path, contents)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-fn bash_sudo_alias_init() -> &'static str {
-    r#"# Generated by roam.
-for profile in "$ROAM_REAL_HOME/.bash_profile" "$ROAM_REAL_HOME/.bash_login" "$ROAM_REAL_HOME/.profile"; do
-  if [ -f "$profile" ]; then
-    . "$profile"
-    break
-  fi
-done
-if [ -f "$ROAM_REAL_HOME/.bashrc" ]; then
-  . "$ROAM_REAL_HOME/.bashrc"
-fi
-alias sudo='roam sudo-passthrough'
-"#
-}
-
-fn zsh_sudo_alias_init_files() -> [(&'static str, String); 5] {
-    [
-        (".zshenv", zsh_source_file(".zshenv", false)),
-        (".zprofile", zsh_source_file(".zprofile", false)),
-        (".zshrc", zsh_source_file(".zshrc", true)),
-        (".zlogin", zsh_source_file(".zlogin", false)),
-        (".zlogout", zsh_source_file(".zlogout", false)),
-    ]
-}
-
-fn zsh_source_file(name: &str, add_alias: bool) -> String {
-    let mut contents = if name == ".zshenv" {
-        format!(
-            "# Generated by roam.\nroam_zdotdir=\"$ZDOTDIR\"\nif [ -f \"$ROAM_REAL_HOME/{name}\" ]; then\n  . \"$ROAM_REAL_HOME/{name}\"\nfi\nZDOTDIR=\"$roam_zdotdir\"\nexport ZDOTDIR\nunset roam_zdotdir\n"
-        )
-    } else {
-        format!(
-            "# Generated by roam.\nif [ -f \"$ROAM_REAL_HOME/{name}\" ]; then\n  . \"$ROAM_REAL_HOME/{name}\"\nfi\n"
-        )
-    };
-    if add_alias {
-        contents.push_str("alias sudo='roam sudo-passthrough'\n");
-    }
-    contents
+    Command::new(shell)
+        .env("ZDOTDIR", &zdotdir)
+        .arg0(login_name)
+        .exec()
 }
 
 fn log_session_open(metadata: &SessionMetadata, abi: i32, writable: &[PathBuf]) {
@@ -777,17 +751,26 @@ fn ll_restrict_self(ruleset_fd: RawFd, flags: u32) -> Result<()> {
     Ok(())
 }
 
-fn clear_cloexec(fd: RawFd) -> Result<()> {
-    // SAFETY: scalar arguments only.
+/// Duplicate `fd` to a number >= `min`, close the original, and return the
+/// new descriptor with FD_CLOEXEC cleared so it survives exec.  Falls back
+/// to clearing CLOEXEC on the original fd when `RLIMIT_NOFILE` is too low.
+fn dup_above(fd: RawFd, min: RawFd) -> Result<RawFd> {
+    // SAFETY: F_DUPFD allocates the lowest fd >= min.
+    let new_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD, min) };
+    if new_fd != -1 {
+        close_fd(fd);
+        return Ok(new_fd);
+    }
+    // F_DUPFD failed (RLIMIT_NOFILE too low); keep the original fd
+    // and just clear CLOEXEC so it survives exec.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     if flags == -1 {
         return Err(std::io::Error::last_os_error().into());
     }
-    // SAFETY: scalar arguments only.
     if unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } == -1 {
         return Err(std::io::Error::last_os_error().into());
     }
-    Ok(())
+    Ok(fd)
 }
 
 fn prctl(
@@ -818,33 +801,32 @@ fn close_fd(fd: RawFd) {
 
 #[cfg(test)]
 mod tests {
-    use super::{bash_sudo_alias_init, zsh_source_file};
+    static BASHRC: &str = include_str!("../../../shell/bashrc");
+    static ZSHRC: &str = include_str!("../../../shell/zshrc");
+    static ZSHENV: &str = include_str!("../../../shell/zshenv");
+    static ZPROFILE: &str = include_str!("../../../shell/zprofile");
 
     #[test]
     fn bash_init_installs_sudo_alias() {
-        let init = bash_sudo_alias_init();
-        assert!(init.contains("alias sudo='roam sudo-passthrough'"));
-        assert!(init.contains("$ROAM_REAL_HOME/.bash_profile"));
+        assert!(BASHRC.contains("alias sudo='roam sudo-passthrough'"));
+        assert!(BASHRC.contains("$ROAM_REAL_HOME/.bash_profile"));
     }
 
     #[test]
     fn zsh_rc_installs_sudo_alias() {
-        let init = zsh_source_file(".zshrc", true);
-        assert!(init.contains(". \"$ROAM_REAL_HOME/.zshrc\""));
-        assert!(init.contains("alias sudo='roam sudo-passthrough'"));
+        assert!(ZSHRC.contains(". \"$ROAM_REAL_HOME/.zshrc\""));
+        assert!(ZSHRC.contains("alias sudo='roam sudo-passthrough'"));
     }
 
     #[test]
     fn zsh_non_rc_files_do_not_install_alias() {
-        let init = zsh_source_file(".zprofile", false);
-        assert!(init.contains(". \"$ROAM_REAL_HOME/.zprofile\""));
-        assert!(!init.contains("alias sudo='roam sudo-passthrough'"));
+        assert!(ZPROFILE.contains(". \"$ROAM_REAL_HOME/.zprofile\""));
+        assert!(!ZPROFILE.contains("alias sudo"));
     }
 
     #[test]
-    fn zshenv_restores_temp_zdotdir_after_sourcing_user_file() {
-        let init = zsh_source_file(".zshenv", false);
-        assert!(init.contains("roam_zdotdir=\"$ZDOTDIR\""));
-        assert!(init.contains("ZDOTDIR=\"$roam_zdotdir\""));
+    fn zshenv_preserves_zdotdir_across_user_sourcing() {
+        assert!(ZSHENV.contains("_roam_zdotdir=\"$ZDOTDIR\""));
+        assert!(ZSHENV.contains("ZDOTDIR=\"$_roam_zdotdir\""));
     }
 }

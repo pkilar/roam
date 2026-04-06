@@ -1,0 +1,4 @@
+# roam shell init for zsh.
+if [ -f "$ROAM_REAL_HOME/.zlogin" ]; then
+  . "$ROAM_REAL_HOME/.zlogin"
+fi

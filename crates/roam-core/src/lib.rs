@@ -7,7 +7,7 @@ pub mod unix;
 
 pub use config::{
     path_matches_blacklist, BlockedPath, BlockedPathKind, SessionConfig, DEFAULT_CONFIG_PATH,
-    DEFAULT_USER, DEFAULT_WRITABLE,
+    DEFAULT_SHELL_DIR, DEFAULT_USER, DEFAULT_WRITABLE,
 };
 pub use error::{Error, Result};
 pub use policy::{

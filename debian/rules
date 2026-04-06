@@ -13,6 +13,12 @@ override_dh_auto_install:
 	install -Dm0644 roam.config.toml $(CURDIR)/debian/roam/etc/roam/config.toml
 	install -Dm0644 roam.policy.toml $(CURDIR)/debian/roam/etc/roam/policy.toml
 	install -Dm0440 roam.sudoers $(CURDIR)/debian/roam/etc/sudoers.d/roam
+	install -Dm0644 shell/bashrc $(CURDIR)/debian/roam/usr/share/roam/.bashrc
+	install -Dm0644 shell/zshenv $(CURDIR)/debian/roam/usr/share/roam/.zshenv
+	install -Dm0644 shell/zprofile $(CURDIR)/debian/roam/usr/share/roam/.zprofile
+	install -Dm0644 shell/zshrc $(CURDIR)/debian/roam/usr/share/roam/.zshrc
+	install -Dm0644 shell/zlogin $(CURDIR)/debian/roam/usr/share/roam/.zlogin
+	install -Dm0644 shell/zlogout $(CURDIR)/debian/roam/usr/share/roam/.zlogout
 	install -Dm0644 README.md $(CURDIR)/debian/roam/usr/share/doc/roam/README.md
 	install -Dm0644 ARCHITECTURE.md $(CURDIR)/debian/roam/usr/share/doc/roam/ARCHITECTURE.md
 

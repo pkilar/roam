@@ -331,6 +331,9 @@ impl SessionConnection {
             .parse()
             .map_err(|_| usage_error("invalid ROAM_BROKER_LOCK_FD"))?;
 
+        check_fd(broker_fd, "ROAM_BROKER_FD")?;
+        check_fd(lock_fd, "ROAM_BROKER_LOCK_FD")?;
+
         // SAFETY: the file descriptor is inherited from the parent shell process.
         let stream = unsafe { UnixStream::from_raw_fd(duplicate_fd(broker_fd)?) };
         Ok(Self { stream, lock_fd })
@@ -465,6 +468,17 @@ fn create_lock_fd() -> Result<RawFd> {
         return Err(std::io::Error::last_os_error().into());
     }
     Ok(fd)
+}
+
+fn check_fd(fd: RawFd, name: &str) -> Result<()> {
+    // SAFETY: F_GETFD is a read-only query on the descriptor table.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+        return Err(Error::message(format!(
+            "broker fd {fd} ({name}) is not valid — \
+             the file descriptor was closed before reaching this command"
+        )));
+    }
+    Ok(())
 }
 
 fn duplicate_fd(fd: RawFd) -> Result<RawFd> {
